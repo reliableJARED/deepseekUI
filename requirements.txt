@@ -1,0 +1,19 @@
+# ── Core (required) ───────────────────────────────────────────────────────────
+httpx>=0.27            # the only dependency of the deepseek_client package itself
+
+# ── Local server ──────────────────────────────────────────────────────────────
+fastapi>=0.115
+uvicorn[standard]>=0.32
+python-multipart>=0.0.12   # multipart/form-data, for media uploads
+
+# ── Media tools (optional: install only what you enable) ──────────────────────
+pillow>=10.4               # still-image resize / compress / format conversion
+opencv-python>=4.10        # video frame extraction and frame-count reduction
+
+# ── MCP client (optional) ─────────────────────────────────────────────────────
+mcp>=2.2                   # official Python SDK; streamable HTTP transport
+
+# ── Not required ──────────────────────────────────────────────────────────────
+# Shipped as part of the standard library / already vendored:
+#   python-dotenv  -> replaced by deepseek_client.config.load_env_file
+#   openai         -> replaced by deepseek_client itself

@@ -1,0 +1,16 @@
+{
+  "_comment": "hand edited by the user",
+  "mcpServers": {
+    "manual": {
+      "url": "http://127.0.0.1:8572/mcp",
+      "allowedTools": [
+        "web_search",
+        "web_fetch"
+      ]
+    },
+    "self": {
+      "url": "http://127.0.0.1:8590/mcp",
+      "prefix": "self"
+    }
+  }
+}

@@ -1,0 +1,32 @@
+# Secrets — never commit
+.env
+*.env
+!.env.example
+
+# Local media / conversation store
+memory/
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Frontend
+node_modules/
+dist/
+.vite/
+
+# Editors / OS
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+.idea/
+Thumbs.db
+.DS_Store

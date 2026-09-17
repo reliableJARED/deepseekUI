@@ -1,0 +1,52 @@
+{
+  // The venv for this project lives outside the workspace, so the interpreter is
+  // pinned explicitly rather than resolved from the folder. Update this path if the
+  // virtualenv moves.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run server (loopback)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "C:\\Users\\jared\\Documents\\code\\code\\Scripts\\python.exe",
+      "args": ["--port", "5099"],
+      "justMyCode": false
+    },
+    {
+      "name": "Run server (LAN enabled)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "C:\\Users\\jared\\Documents\\code\\code\\Scripts\\python.exe",
+      "args": ["--port", "5099", "--lan"],
+      "justMyCode": false
+    },
+    {
+      "name": "Run server (reload)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "C:\\Users\\jared\\Documents\\code\\code\\Scripts\\python.exe",
+      "args": ["--port", "5099", "--reload"],
+      "justMyCode": false
+    },
+    {
+      "name": "Debug tests",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "C:\\Users\\jared\\Documents\\code\\code\\Scripts\\python.exe",
+      "args": ["tests", "-q"],
+      "justMyCode": false
+    }
+  ]
+}

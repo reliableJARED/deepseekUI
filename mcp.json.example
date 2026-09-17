@@ -1,0 +1,54 @@
+{
+  "_comment": [
+    "MCP servers for deepseekUI. Copy to `mcp.json` and edit.",
+    "",
+    "You can also edit all of this from Settings -> MCP servers, which writes back",
+    "to this file in place. Editing by hand still works: press Reload afterwards.",
+    "",
+    "Either shape is accepted, and whichever you write is the shape saved back:",
+    "  {\"servers\": [ ... ]}        a list, as below",
+    "  {\"mcpServers\": { ... }}     keyed by name, as most MCP clients write it",
+    "Unknown top-level keys (like this `_comment`) are preserved across a save.",
+    "",
+    "Transport is Streamable HTTP only. There is no stdio support: this server is",
+    "itself already a local process, so it will not spawn children for you.",
+    "",
+    "Each tool is exposed to the model as `<prefix>__<tool>`. Set `prefix` when two",
+    "servers expose the same tool name, otherwise the last one registered wins.",
+    "",
+    "For a stdio-only server, bridge it yourself and point `url` at the bridge.",
+    "The reference filesystem server, for example:",
+    "  npx -y mcp-proxy --port 8931 -- npx -y @modelcontextprotocol/server-filesystem C:/work",
+    "",
+    "`self-reflection` is deepseekUI's own source, read-only. It is NOT started for",
+    "you: run `python mcp_server/self_reflection.py` first, then set `enabled` to true.",
+    "It exposes self__introspect, self__explain_file and self__read_source. Do not add",
+    "`allowedTools` there: that key is a filter, and anything unlisted is hidden."
+  ],
+
+  "servers": [
+    {
+      "name": "filesystem",
+      "url": "http://127.0.0.1:8931/mcp",
+      "enabled": true,
+      "prefix": "fs",
+      "timeout": 120
+    },
+    {
+      "name": "example-with-auth",
+      "url": "https://mcp.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${MY_MCP_TOKEN}"
+      },
+      "enabled": false,
+      "allowedTools": ["search", "fetch_page"],
+      "prefix": "ex"
+    },
+    {
+      "name": "self-reflection",
+      "url": "http://127.0.0.1:8590/mcp",
+      "enabled": false,
+      "prefix": "self"
+    }
+  ]
+}
