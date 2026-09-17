@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>frontend self-test</title>
+<style>
+  body { background: #14161a; color: #d8dee9; font: 13px/1.5 monospace; margin: 0; padding: 16px; }
+  pre#out { white-space: pre-wrap; }
+  .ok { color: #7fd18a; }
+  .bad { color: #ff6b6b; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>frontend self-test</h1>
+<p>Dev-only page. Nothing links to it; it exists because the frontend is hand-written
+ES modules with no build step and no Node, so this browser page is the only way to
+assert that the highlighter and the code blocks behave. Open it over HTTP (the
+server has to serve <code>/assets/</code>) and read <code>window.__harness</code>:
+it must say <b>ALL PASS</b>. It asserts that highlighting is lossless and that every
+line is balanced, and it does that by parsing the output as HTML — markup that only
+looks like HTML fails the round-trip.</p>
+<pre id="out">running…</pre>
+<pre id="vis" style="display:none"></pre>
+<script type="module">
+import {
+  detectLanguage, highlightLines, highlight, isTextName,
+  languageForHint, languageForName, languageLabel, resolveLanguage,
+} from '/assets/highlight.js';
+import { codeBlock, readFileListing, uiKindForFile } from '/assets/media.js';
+
+const lines = [];
+let failures = 0;
+const fail = (msg) => { failures += 1; lines.push(`BAD  ${msg}`); };
+const pass = (msg) => lines.push(`ok   ${msg}`);
+
+/* ── helpers ─────────────────────────────────────────────────────────── */
+
+// Decode by handing the HTML to the parser: this both strips the tags and decodes
+// the entities, and it proves the markup is parseable HTML rather than text that
+// merely looks like it. A raw `<` that should have been escaped gets swallowed by
+// the parser and the round-trip comparison catches it.
+function decode(html) {
+  const host = document.createElement('div');
+  host.innerHTML = html;
+  return host.textContent;
+}
+
+function spanBalance(html) {
+  const open = (html.match(/<span/g) || []).length;
+  const close = (html.match(/<\/span>/g) || []).length;
+  return open === close;
+}
+
+/* ── corpus ──────────────────────────────────────────────────────────── */
+
+const SAMPLES = [
+  ['python', `#!/usr/bin/env python3
+"""Docstring with & < > " ' inside."""
+from pathlib import Path
+
+@decorator(arg=1)
+class Thing(Base):
+    x: int = 0x1F          # comment: 1 < 2 && 3 > 2
+    def go(self, *a, **kw):
+        f = f"value={self.x!r} & more"
+        t = (1 + 2) * 3 / 4
+        return f, t
+`],
+  ['javascript', `const t = \`hello \${name} <b> & </b>\`;
+function f(a, b) { return a ?? b; }
+// comment with ' and " and \` and < >
+let re = /<span>\\d+<\\/span>/g;
+export default class A extends B { #p = 1; }
+`],
+  ['typescript', `interface P { readonly id: number; }
+type U = string | number;
+const g = <T,>(v: T): T => v;
+class S implements P { readonly id = 1; }
+`],
+  ['json', `{"a": 1, "b": [true, null, -2.5e3], "c\\u00e9": "x & <y>", "d": {"e": {}}}`],
+  ['shell', `#!/bin/bash
+set -euo pipefail
+x="a & b > c"
+for i in 1 2 3; do echo "\${i}" | grep -v '^#'; done
+export PATH="$PATH:/usr/local/bin"
+`],
+  ['powershell', `$ErrorActionPreference = 'Stop'
+function Get-Thing { param([string]$Name) Write-Output "hi $Name" }
+Get-ChildItem -Path . | Where-Object { $_.Length -gt 0 }
+`],
+  ['sql', `SELECT id, COUNT(*) AS n
+FROM users
+WHERE name LIKE '%<a>%' AND created_at > '2020-01-01'
+GROUP BY id HAVING COUNT(*) > 1;
+`],
+  ['go', `package main
+import "fmt"
+func main() {
+	x := []int{1, 2}
+	fmt.Printf("%d & %v\\n", x[0], x)
+}
+`],
+  ['rust', `use std::collections::HashMap;
+fn main() -> Result<(), Box<dyn Error>> {
+    let mut m: HashMap<&str, u8> = HashMap::new();
+    m.insert("a", 1);
+    println!("{:?}", m);
+    Ok(())
+}
+`],
+  ['java', `public final class A implements B {
+    private static final int N = 3;
+    public static void main(String[] args) {
+        var s = "x < y";
+        System.out.println(s);
+    }
+}
+`],
+  ['kotlin', `data class P(val id: Int, val name: String)
+fun main() {
+    val xs = listOf(1, 2, 3)
+    println(xs.sum())
+}
+`],
+  ['csharp', `using System;
+namespace App {
+    public class Thing {
+        public int Id { get; set; } = 1;
+        static void Main() => Console.WriteLine($"hi {DateTime.Now}");
+    }
+}
+`],
+  ['c', `#include <stdio.h>
+#define N 4
+static int add(int a, int b) { return a + b; }
+int main(void) {
+    char *s = "a < b";
+    printf("%s %d\\n", s, add(N, 1));
+    return 0;
+}
+`],
+  ['ruby', `class Thing
+  attr_reader :x
+  def initialize(x)
+    @x = x
+  end
+end
+puts "value: #{Thing.new(1).x}" if $VERBOSE
+`],
+  ['php', `<?php
+namespace App;
+class Thing {
+    public function __construct(private int $x) {}
+    public function get(): int { return $this->x; }
+}
+echo "hi {$x}" . PHP_EOL;
+`],
+  ['perl', `#!/usr/bin/perl
+use strict;
+use warnings;
+my %h = (a => 1, b => 2);
+foreach my $k (sort keys %h) { print "$k=$h{$k}\\n"; }
+`],
+  ['lua', `local function f(a, b)
+  if a < b then return "a & b" end
+  return nil
+end
+print(f(1, 2))
+`],
+  ['r', `f <- function(x, y = 1) {
+  if (x > y) { return(x - y) }
+  y
+}
+print(f(3, 2))
+`],
+  ['yaml', `name: build
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+`],
+  ['toml', `[package]
+name = "thing"
+version = "0.1.0"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+`],
+  ['ini', `[core]
+editor = vim
+autocrlf = false
+
+[alias]
+st = status
+`],
+  ['dockerfile', `FROM python:3.11-slim AS base
+WORKDIR /app
+COPY . .
+RUN pip install --no-cache-dir -r requirements.txt
+CMD ["python", "run.py"]
+`],
+  ['makefile', `CC := gcc
+CFLAGS += -Wall -O2
+
+all: main
+
+main: main.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+clean:
+	rm -f *.o
+`],
+  ['html', `<!doctype html>
+<html class="x" data-a="1 & 2">
+<head><style>.a { color: red }</style></head>
+<body>
+  <!-- a & b < c -->
+  <div id="d">text &amp; &lt; literal</div>
+  <script>let x = 1 < 2 && "a" > "b";<\/script>
+</body>
+</html>
+`],
+  ['xml', `<?xml version="1.0"?>
+<root xmlns:x="urn:a">
+  <item k="v &amp; w">&lt;text&gt;</item>
+</root>
+`],
+  ['css', `@media (min-width: 40rem) {
+  .a > .b + .c[data-x="y"]::before {
+    content: "a & b < c";
+    color: #fff;
+  }
+}
+`],
+  ['markdown', `# Title & "more"
+
+Some *emphasis* and \`inline <code> & stuff\`.
+
+- item
+- [link](https://example.com/a?b=1&c=2)
+
+\`\`\`python
+x = 1 < 2
+\`\`\`
+`],
+  ['diff', `diff --git a/f.py b/f.py
+index 1234567..89abcde 100644
+--- a/f.py
++++ b/f.py
+@@ -1,3 +1,4 @@
+ old line
+-removed <x>
++added & y
+ context
+`],
+  ['text', `just prose with <angle> & ampersand and "quotes" and it's fine.
+second line
+`],
+  ['', ''],
+  ['python', ''],
+  ['python', 'no trailing newline'],
+  ['python', 'x = "unterminated\n'],
+  ['python', `print("a < b && c > d")  # ' " \` '`],
+  ['python', '<span class="t-kw">not really html</span>'],
+  ['python', '&amp; &lt; &gt; &#39; &quot;'],
+  ['python', '\t\ttabs and    spaces\n   leading\n'],
+  ['python', 'line1\r\nline2\r\nline3'],
+  ['python', '\n\n\n'],
+  ['python', 'é ü ß — ☃ 😀 中文 العربية\n'],
+  ['python', `x = 1  ${'y'.repeat(400)}`],
+  ['python', '\\n escaped backslash \\\\ and a lone \\'],
+  ['javascript', 'a</span>b<span>c'],
+  ['json', '{"<span>": "</span>"}'],
+];
+
+/* ── 1. losslessness, line count, span balance ───────────────────────── */
+
+let checked = 0;
+for (const [lang, code] of SAMPLES) {
+  const label = `${lang || '(none)'} ${JSON.stringify(code.slice(0, 28))}`;
+  let out;
+  try {
+    out = highlightLines(code, lang);
+  } catch (err) {
+    fail(`${label}: highlightLines threw ${err}`);
+    continue;
+  }
+  checked += 1;
+
+  if (!Array.isArray(out)) { fail(`${label}: not an array`); continue; }
+
+  const wanted = code.split('\n').length;
+  if (out.length !== wanted) fail(`${label}: ${out.length} lines out, expected ${wanted}`);
+
+  const joined = out.join('\n');
+  const back = decode(joined);
+  // Line endings are normalised to \n by the highlighter, deliberately and for every
+  // caller, so that is what the round-trip is measured against.
+  const want = code.replace(/\r\n?/g, '\n');
+  if (back !== want) {
+    const at = [...want].findIndex((ch, i) => back[i] !== ch);
+    fail(`${label}: round-trip differs at ${at}\n       in : ${JSON.stringify(want.slice(Math.max(0, at - 12), at + 12))}\n       out: ${JSON.stringify(back.slice(Math.max(0, at - 12), at + 12))}`);
+  }
+
+  out.forEach((html, i) => {
+    if (!spanBalance(html)) fail(`${label}: line ${i + 1} has unbalanced spans`);
+    if (/<[^s/]/.test(html.replace(/<span[^>]*>/g, ''))) {
+      fail(`${label}: line ${i + 1} emitted a tag other than span`);
+    }
+  });
+}
+pass(`lossless + balanced over ${checked} samples`);
+
+/* ── 2. highlight() wrapper and one-line convenience ─────────────────── */
+
+try {
+  if (decode(highlight('a < b', 'python')) !== 'a < b') fail('highlight() lost text');
+  else pass('highlight() round-trips');
+} catch (err) { fail(`highlight() threw ${err}`); }
+
+/* ── 3. name / hint resolution ───────────────────────────────────────── */
+
+const NAME_CASES = [
+  ['app.py', 'python'], ['Makefile', 'makefile'], ['Dockerfile', 'dockerfile'],
+  ['notes.md', 'markdown'], ['styles.css', 'css'], ['data.json', 'json'],
+  ['index.html', 'html'], ['a.ts', 'typescript'], ['a.tsx', 'typescript'],
+  ['run.sh', 'shell'], ['q.sql', 'sql'], ['go.mod', 'go'], ['Cargo.toml', 'toml'],
+  ['server/routes.py', 'python'], ['C:\\code\\a.py', 'python'],
+  ['MAKEFILE', 'makefile'], ['.gitignore', 'ini'], ['.env', 'ini'],
+  ['x.unknownext', ''], ['noext', ''], ['.py', ''], ['user_file_17.pdf', ''],
+];
+for (const [name, want] of NAME_CASES) {
+  const got = languageForName(name);
+  if (got !== want) fail(`languageForName(${JSON.stringify(name)}) = ${JSON.stringify(got)}, wanted ${JSON.stringify(want)}`);
+}
+pass(`languageForName over ${NAME_CASES.length} names`);
+
+const TEXT_NAMES = ['.gitignore', 'Makefile', 'LICENSE', 'requirements.txt', 'a.py', 'a.json', 'a.md'];
+for (const name of TEXT_NAMES) {
+  if (!isTextName(name)) fail(`isTextName(${JSON.stringify(name)}) is false`);
+}
+for (const name of ['a.png', 'b.mp4', 'c.zip', 'd.pdf', 'e.exe']) {
+  if (isTextName(name)) fail(`isTextName(${JSON.stringify(name)}) is true`);
+}
+pass(`isTextName over ${TEXT_NAMES.length + 5} names`);
+
+// A fence hint is often a whole filename, and an unknown hint must mean "plain"
+// rather than "guess".
+const HINT_CASES = [
+  ['app.py', 'python'], ['```python', 'python'], ['Python', 'python'],
+  ['js title="x"', 'javascript'], ['json,{x=1}', 'json'],
+  ['.py', ''], ['text', ''], ['ocaml', ''], ['', ''],
+];
+for (const [hint, want] of HINT_CASES) {
+  const got = languageForHint(hint);
+  if (got !== want) fail(`languageForHint(${JSON.stringify(hint)}) = ${JSON.stringify(got)}, wanted ${JSON.stringify(want)}`);
+}
+pass(`languageForHint over ${HINT_CASES.length} hints`);
+
+if (languageLabel('python') !== 'python') fail('languageLabel(python)');
+if (languageLabel('') !== 'text') fail(`languageLabel('') = ${languageLabel('')}`);
+if (languageLabel('ocaml') !== 'ocaml') fail(`languageLabel(ocaml) = ${languageLabel('ocaml')}`);
+pass('languageLabel falls back to the hint then to text');
+
+/* ── 4. detection ────────────────────────────────────────────────────── */
+
+const DETECT = [
+  ['python', SAMPLES[0][1], 'python'],
+  ['python', `def f(x):\n    return x + 1\n\nclass A:\n    pass\n`, 'python'],
+  ['json', `{"a": [1, 2, 3], "b": {"c": true, "d": null}}`, 'json'],
+  ['shell', `#!/bin/bash\nset -e\nfor i in $(seq 1 3); do echo $i; done\n`, 'shell'],
+  ['html', `<!doctype html>\n<html>\n<body><div class="a">hi</div></body>\n</html>\n`, 'html'],
+  ['css', `:root { --x: 1rem; }\n.a > .b { color: #fff; margin: 0 auto; }\n`, 'css'],
+  ['sql', `SELECT a, b FROM t WHERE c > 1 GROUP BY a ORDER BY a;\n`, 'sql'],
+  ['diff', `--- a/x\n+++ b/x\n@@ -1 +1 @@\n- old\n+ new\n`, 'diff'],
+  ['makefile', `CC := gcc\nCFLAGS += -Wall\n\nall: main\n\nmain: main.o\n\t$(CC) -o $@ $^\n`, 'makefile'],
+  ['dockerfile', `FROM python:3.11-slim\nWORKDIR /app\nRUN pip install flask\nCMD ["python", "app.py"]\n`, 'dockerfile'],
+  ['yaml', `name: ci\non:\n  push:\n    branches: [main]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n`, 'yaml'],
+  ['go', `package main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println("hi")\n}\n`, 'go'],
+  ['rust', `use std::io;\n\nfn main() {\n    let mut s = String::new();\n    io::stdin().read_line(&mut s).unwrap();\n}\n`, 'rust'],
+  ['java', `package com.x;\n\nimport java.util.List;\n\npublic class A {\n    public static void main(String[] args) {\n        System.out.println("hi");\n    }\n}\n`, 'java'],
+  ['', `Hello there.\n\nThis is just prose. It has sentences and commas, but no code.\n`, ''],
+  ['', `The quick brown fox jumps over the lazy dog.\nAnd another sentence follows it here.\n`, ''],
+];
+const detection = [];
+for (const [label, code, want] of DETECT) {
+  let got;
+  try { got = detectLanguage(code); } catch (err) { fail(`detectLanguage threw on ${label}: ${err}`); continue; }
+  const mark = got === want ? 'ok ' : 'BAD';
+  if (got !== want) failures += 1;
+  detection.push(`${mark}  want ${(want || '(none)').padEnd(11)} got ${(got || '(none)').padEnd(11)} ${label}`);
+}
+lines.push(...detection);
+
+// resolveLanguage: a known hint wins, an unknown hint suppresses detection.
+if (resolveLanguage('def f(): pass', 'json') !== 'json') fail('resolveLanguage ignored a known hint');
+if (resolveLanguage('{"a": 1, "b": 2}', 'text') !== '') fail('resolveLanguage let text fall through to detection');
+if (resolveLanguage('def f(): pass\nclass A: pass\n', '') !== 'python') fail('resolveLanguage did not detect when the hint was empty');
+if (resolveLanguage('def f(): pass\nclass A: pass\n', null) !== 'python') fail('resolveLanguage did not detect when the hint was null');
+pass('resolveLanguage: hint wins, unknown hint suppresses, empty hint detects');
+
+/* ── 5. read_file listing recognition ───────────────────────────────── */
+
+// The exact shape tools_builtin.read_file emits: a header ending in an em dash, the
+// gutter immediately below it, and the optional "more follows" footer — joined with
+// single newlines.
+const LISTING = `server/routes.py — 46.2 KB, 1,040 lines, utf-8; showing characters 0–20,000 (lines 1-11)
+    1  from __future__ import annotations
+    2  
+    3  import copy
+    4  import json
+    5  
+   10  def f(x):
+   11      return x + 1
+[more follows — call read_file(path='server/routes.py', offset=20000)]`;
+
+const listing = readFileListing(LISTING);
+if (!listing) {
+  fail('readFileListing did not recognise a real read_file listing');
+} else {
+  if (listing.name !== 'server/routes.py') fail(`listing name = ${JSON.stringify(listing.name)}`);
+  if (listing.startLine !== 1) fail(`listing startLine = ${listing.startLine}`);
+  if (listing.code.includes('    1  ')) fail('listing still carries the gutter');
+  if (!listing.code.startsWith('from __future__ import annotations')) fail('listing lost its first line');
+  if (!listing.code.includes('def f(x):')) fail('listing lost a later line');
+  if (listing.code.includes('[more follows')) fail('listing kept the footer');
+  if (!listing.code.startsWith('from __future__') || listing.code.split(String.fromCharCode(10)).length !== 7) {
+    fail('listing code line count = ' + listing.code.split(String.fromCharCode(10)).length);
+  }
+  if (!listing.note.startsWith('[more follows')) fail('listing note = ' + JSON.stringify(listing.note));
+  pass('readFileListing parses the tool output');
+}
+
+// Offsets other than 1, and page 2.
+const PAGE2 = `read_file → server/tools_builtin.py
+
+ 4000  line four thousand
+ 4001  another
+ 4002  last
+`;
+const page = readFileListing(PAGE2);
+if (!page) fail('readFileListing missed a paged listing');
+else {
+  if (page.startLine !== 4000) fail(`paged startLine = ${page.startLine}`);
+  if (page.code.split('\n').length !== 3) fail(`paged code has ${page.code.split('\n').length} lines`);  pass('readFileListing handles a later page and blank padding');}
+
+// Negatives: prose that happens to contain one numbered line must stay prose.
+for (const prose of [
+  'Here is the code:\n    1  print("hi")\nand that is all.',
+  'Step 1 2 3 done.\nNo gutter here.',
+  'The file has 1  spaces and then words.',
+  '  1  only one numbered line and then prose that continues on.',
+  "a\\n\\n\\nb\\n",
+  "\\n\\n\\n",
+  "[file 'notes.md' — 2.1 KB, 40 lines, utf-8]\\nthe file itself\\nwith no gutter at all\\n",
+]) {
+  if (readFileListing(prose)) fail(`readFileListing converted prose: ${JSON.stringify(prose.slice(0, 40))}`);
+}
+if (readFileListing('')) fail('readFileListing converted the empty string');
+pass('readFileListing rejects prose');
+
+/* ── 6. codeBlock rendering ─────────────────────────────────────────── */
+
+const cb = codeBlock('a = 1 < 2\nb = "x &\ny = (3)\n', 'python', { numbered: true, startLine: 7 });
+if (!cb.classList.contains('code-block')) fail('codeBlock lacks .code-block');
+const gutters = cb.querySelectorAll('.ln');
+if (gutters.length !== 3) fail(`codeBlock produced ${gutters.length} gutters, wanted 3`);
+else if (gutters[0].textContent !== '7' || gutters[2].textContent !== '9') {
+  fail(`gutter numbers = ${[...gutters].map((g) => g.textContent).join(',')}`);
+}
+if (!(cb.__source || '').includes('a = 1 < 2')) fail('codeBlock did not keep __source for the clipboard');
+if ((cb.__source || '').length !== 'a = 1 < 2\nb = "x &\ny = (3)\n'.length) {
+  fail('codeBlock __source is not the bare code');
+}
+const plain = codeBlock('x', 'python', {});
+if (plain.querySelectorAll('.ln').length) fail('unnumbered codeBlock rendered gutters');
+
+// The trailing line break has to be peeled whatever it is. A Windows file ends `\r\n`,
+// and dropping only the `\n` leaves a `\r` that the tokenizer turns back into a line
+// break — which reached the real UI as a phantom empty last line on every CRLF file.
+const ENDINGS = [['a\nb\n', 2], ['a\nb\r\n', 2], ['a\nb', 2], ['a\n\n', 2], ['\n', 1], ['a\r\nb\r\nc', 3]];
+for (const [code, want] of ENDINGS) {
+  const got = codeBlock(code, 'python', { numbered: true }).querySelectorAll('.ln').length;
+  if (got !== want) fail(`codeBlock(${JSON.stringify(code)}) numbered ${got} lines, wanted ${want}`);
+}
+const offsetCrlf = [...codeBlock('a\nb\r\n', 'python', { numbered: true, startLine: 7 }).querySelectorAll('.ln')]
+  .map((n) => n.textContent).join(',');
+if (offsetCrlf !== '7,8') fail(`crlf listing gutters = ${offsetCrlf}`);
+pass('codeBlock: gutters, offsets, __source, unnumbered, line endings');
+
+/* ── 7. uiKindForFile ────────────────────────────────────────────────── */
+
+const fileCases = [
+  ['a.py', 'text/plain', 'code'], ['Makefile', '', 'code'], ['.gitignore', '', 'code'],
+  ['a.json', 'application/json', 'code'], ['a.md', 'text/markdown', 'code'],
+  ['notes.txt', 'text/plain', 'code'], ['a.png', 'image/png', 'image'],
+  ['b.mp4', 'video/mp4', 'video'], ['c.mp3', 'audio/mpeg', 'audio'],
+  ['d.zip', 'application/zip', 'file'],
+];
+for (const [name, type, want] of fileCases) {
+  const got = uiKindForFile(new File(['x'], name, { type }));
+  if (got !== want) fail(`uiKindForFile(${name}) = ${got}, wanted ${want}`);
+}
+pass(`uiKindForFile over ${fileCases.length} files`);
+
+/* ── report ─────────────────────────────────────────────────────────── */
+
+lines.unshift(failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`);
+document.getElementById('out').textContent = lines.join('\n');
+window.__harness = { failures, lines };
+</script>
+</body>
+</html>

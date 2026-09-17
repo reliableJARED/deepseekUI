@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>deepseekUI</title>
+<link rel="stylesheet" href="/assets/app.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b8def'/%3E%3Cpath d='M9 21V11h6a5 5 0 0 1 0 10H9Z' fill='%23fff'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<!-- ── startup / fatal overlay ─────────────────────────────────────────────── -->
+<div id="boot" class="boot">
+  <div class="boot-card">
+    <div class="spinner" aria-hidden="true"></div>
+    <p>Starting…</p>
+  </div>
+</div>
+
+<!-- ── configuration banner, shown when the server has no usable API key ──── -->
+<div id="setup-banner" class="banner" hidden>
+  <div class="banner-body">
+    <strong>No DeepSeek API key.</strong>
+    <p id="setup-message"></p>
+    <p>
+      There is no API key listed for Deepseek, if you need one go
+      <a href="https://platform.deepseek.com/sign_up" target="_blank" rel="noopener noreferrer">here</a>,
+      sign up, follow the steps to get a new key and paste it in to the
+      <b>Settings</b> area for Deepseek API key. It is used on the next message —
+      no restart.
+    </p>
+    <div class="kv-row banner-actions">
+      <button type="button" class="mini-btn primary" id="banner-settings">Open Settings</button>
+    </div>
+  </div>
+  <button class="icon-btn" id="dismiss-banner" title="Dismiss" aria-label="Dismiss">&times;</button>
+</div>
+
+<div id="shell" class="shell" hidden>
+
+  <!-- ── sidebar ───────────────────────────────────────────────────────────── -->
+  <aside class="sidebar" id="sidebar">
+    <header class="sidebar-head">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">deepseekUI</span>
+      </div>
+      <button class="icon-btn" id="toggle-sidebar" title="Hide sidebar" aria-label="Hide sidebar">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>
+      </button>
+    </header>
+
+    <button class="new-chat" id="new-chat">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+      <span>New conversation</span>
+    </button>
+
+    <div class="search-wrap">
+      <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4.3-4.3"/></svg>
+      <input id="search" type="search" placeholder="Search conversations" autocomplete="off" spellcheck="false">
+    </div>
+
+    <nav class="conv-list" id="conv-list" aria-label="Conversations"></nav>
+
+    <footer class="sidebar-foot">
+      <button class="foot-btn" id="open-settings" title="Settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2v.2a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 7 19.4a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0-1.2-2.9H1a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 2.6 7a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H7a1.7 1.7 0 0 0 1-1.5V1a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V7a1.7 1.7 0 0 0 1.5 1H23a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>
+        <span>Settings</span>
+      </button>
+      <button class="foot-btn" id="theme-toggle" title="Switch theme">
+        <span id="theme-icon">☾</span>
+        <span id="theme-label">Dark</span>
+      </button>
+    </footer>
+  </aside>
+
+  <!-- ── main ──────────────────────────────────────────────────────────────── -->
+  <main class="main" id="main">
+
+    <header class="topbar">
+      <button class="icon-btn hidden" id="show-sidebar" title="Show sidebar" aria-label="Show sidebar">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+      </button>
+
+      <div class="title-block">
+        <h1 class="conv-title" id="conv-title" contenteditable="false" spellcheck="false">No conversation</h1>
+        <div class="conv-meta" id="conv-meta"></div>
+      </div>
+
+      <div class="topbar-actions">
+        <button class="icon-btn" id="export-conv" title="Export this conversation" aria-label="Export">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
+        </button>
+        <button class="icon-btn danger" id="delete-conv" title="Delete this conversation" aria-label="Delete">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="context-bar" id="context-bar" hidden>
+      <div class="context-track"><div class="context-fill" id="context-fill"></div></div>
+      <span class="context-text" id="context-text"></span>
+    </div>
+
+    <!-- ── transcript ──────────────────────────────────────────────────────── -->
+    <div class="transcript" id="transcript"></div>
+
+    <div class="empty-state" id="empty-state">
+      <div class="empty-mark" aria-hidden="true"></div>
+      <h2>Nothing here yet</h2>
+      <p>Start a conversation, or drop an image or video anywhere on this panel.</p>
+
+      <!-- Swapped in for the suggestion chips when no key is stored: a new chat is
+           exactly where someone discovers they cannot send anything. -->
+      <div class="empty-setup" id="empty-setup" hidden>
+        <p>
+          There is no API key listed for Deepseek, if you need one go
+          <a href="https://platform.deepseek.com/sign_up" target="_blank" rel="noopener noreferrer">here</a>,
+          sign up, follow the steps to get a new key and paste it in to the
+          <b>Settings</b> area for Deepseek API key.
+        </p>
+        <p class="dim" id="empty-setup-why"></p>
+        <button type="button" class="mini-btn primary" id="empty-settings">Open Settings</button>
+      </div>
+
+      <div class="hints" id="empty-hints"></div>
+    </div>
+
+    <!-- ── composer ────────────────────────────────────────────────────────── -->
+    <div class="composer-wrap">
+      <div class="attachments" id="attachments" hidden></div>
+
+      <form class="composer" id="composer">
+        <div class="composer-row">
+          <button type="button" class="icon-btn" id="attach-btn" title="Attach image or video" aria-label="Attach">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11l-8.5 8.5a5.5 5.5 0 1 1-7.8-7.8L13 3.5a3.7 3.7 0 0 1 5.2 5.2L10 16.9a1.8 1.8 0 0 1-2.6-2.6l7.4-7.4"/></svg>
+          </button>
+
+          <textarea id="input" rows="1" placeholder="Message the model…  (Enter to send, Shift+Enter for a new line)" spellcheck="false"></textarea>
+
+          <button type="submit" class="send-btn" id="send-btn" title="Send" aria-label="Send">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h13M13 6l6 6-6 6"/></svg>
+          </button>
+          <button type="button" class="send-btn stop" id="stop-btn" title="Stop" aria-label="Stop" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>
+          </button>
+        </div>
+
+        <div class="composer-bar">
+          <label class="mini-field">
+            <span>Model</span>
+            <select id="model-select"></select>
+          </label>
+
+          <label class="mini-field">
+            <span>Thinking</span>
+            <select id="effort-select"></select>
+          </label>
+
+          <label class="mini-field check">
+            <input type="checkbox" id="tools-toggle" checked>
+            <span>Tools</span>
+          </label>
+
+          <span class="spacer"></span>
+
+          <label class="mini-field check" title="Save the system prompt as the default for new conversations">
+            <input type="checkbox" id="default-system">
+            <span>Default</span>
+          </label>
+
+          <button type="button" class="mini-btn" id="system-btn" title="Edit the system prompt">System prompt</button>
+        </div>
+      </form>
+      <p class="composer-note" id="composer-note"></p>
+    </div>
+  </main>
+</div>
+
+<!-- ── system prompt drawer ────────────────────────────────────────────────── -->
+<div class="drawer-scrim" id="system-scrim" hidden></div>
+<section class="drawer" id="system-drawer" hidden aria-label="System prompt">
+  <header class="drawer-head">
+    <h2>System prompt</h2>
+    <button class="icon-btn" id="close-system" aria-label="Close">&times;</button>
+  </header>
+  <div class="drawer-body">
+    <p class="dim">
+      This is prepended to every request in this conversation. It is never shown to the
+      model as a separate message, and it is stored with the conversation.
+    </p>
+    <label class="field">
+      <span>Base instructions</span>
+      <textarea id="sys-base" rows="12" spellcheck="false"
+        placeholder="You are a careful, concise assistant. Prefer showing your work over asserting conclusions."></textarea>
+    </label>
+    <label class="field">
+      <span>Current task <span class="dim">(optional — appended separately so it can be swapped without rewriting the rest)</span></span>
+      <textarea id="sys-todo" rows="6" spellcheck="false"
+        placeholder="Right now: …"></textarea>
+    </label>
+    <div class="preview-block">
+      <span class="field-label">Effective prompt</span>
+      <pre id="sys-preview" class="preview"></pre>
+    </div>
+  </div>
+  <footer class="drawer-foot">
+    <button class="mini-btn" id="sys-clear">Clear</button>
+    <span class="spacer"></span>
+    <button class="mini-btn primary" id="sys-save">Save</button>
+  </footer>
+</section>
+
+<!-- ── settings drawer ─────────────────────────────────────────────────────── -->
+<div class="drawer-scrim" id="settings-scrim" hidden></div>
+<section class="drawer" id="settings-drawer" hidden aria-label="Settings">
+  <header class="drawer-head">
+    <h2>Settings</h2>
+    <button class="icon-btn" id="close-settings" aria-label="Close">&times;</button>
+  </header>
+  <div class="drawer-body">
+
+    <h3>DeepSeek API key</h3>
+    <p class="dim">
+      Written to <code id="set-key-file">.env</code> and applied to the next message
+      you send — no restart. The key is never sent anywhere except DeepSeek, and it is
+      never echoed back to this page. To view the current key look at the .env file
+    </p>
+    <p class="dim" id="set-key-status"></p>
+
+    <div class="field">
+      <span>API key</span>
+      <div class="key-row">
+        <input type="password" id="set-api-key" placeholder="sk-…" autocomplete="off"
+               autocapitalize="off" spellcheck="false">
+        <button type="button" class="mini-btn" id="reveal-key" aria-pressed="false"
+                title="Show the key while you check what was pasted">Show</button>
+      </div>
+    </div>
+
+    <div class="kv-row">
+      <button type="button" class="mini-btn primary" id="save-api-key">Save key</button>
+      <button type="button" class="mini-btn" id="clear-api-key">Clear field</button>
+    </div>
+
+    <p class="dim">
+      Need a key?
+      <a href="https://platform.deepseek.com/sign_up" target="_blank" rel="noopener noreferrer">Sign up at platform.deepseek.com</a>,
+      follow the steps, then paste the key above.
+    </p>
+
+    <h3>This browser</h3>
+    <p class="dim">Stored in <code>localStorage</code>. Nothing here is sent anywhere.</p>
+
+    <label class="field">
+      <span>Default system prompt for new conversations</span>
+      <textarea id="set-default-system" rows="8" spellcheck="false"></textarea>
+    </label>
+
+    <div class="kv-row">
+      <label class="mini-field check">
+        <input type="checkbox" id="set-expand-reasoning">
+        <span>Expand reasoning by default</span>
+      </label>
+      <label class="mini-field check">
+        <input type="checkbox" id="set-autoscroll" checked>
+        <span>Follow the stream</span>
+      </label>
+      <label class="mini-field check">
+        <input type="checkbox" id="set-enter-sends" checked>
+        <span>Enter sends</span>
+      </label>
+    </div>
+
+    <h3>Storage</h3>
+    <p class="dim">
+      Conversations live on disk under <code id="set-memory-root">memory/</code>, one folder
+      each, as plain files. Copying that folder is a complete backup.
+    </p>
+    <div class="kv-row">
+      <button class="mini-btn" id="import-btn">Import a conversation…</button>
+      <input type="file" id="import-file" accept="application/json,.json" hidden>
+    </div>
+
+    <h3>MCP servers</h3>
+    <p class="dim">
+      Saved in <code id="mcp-path">mcp.json</code>. Editing that file by hand still works —
+      press <em>Reload</em> when you are done.
+    </p>
+    <div id="mcp-status" class="mcp-status"></div>
+
+    <form id="mcp-editor" class="mcp-editor" hidden autocomplete="off">
+      <div class="mcp-editor-head">
+        <strong id="mcp-editor-title">Add an MCP server</strong>
+        <button type="button" class="icon-btn" id="mcp-cancel" aria-label="Cancel editing">&times;</button>
+      </div>
+
+      <label class="field">
+        <span>Name</span>
+        <input type="text" id="mcp-name" placeholder="websearch" spellcheck="false">
+      </label>
+
+      <label class="field">
+        <span>Streamable HTTP URL</span>
+        <input type="text" id="mcp-url" placeholder="http://127.0.0.1:8569/mcp" spellcheck="false">
+      </label>
+
+      <div class="mcp-editor-grid">
+        <label class="field">
+          <span>Tool prefix <span class="dim">(optional)</span></span>
+          <input type="text" id="mcp-prefix" placeholder="ws" spellcheck="false">
+        </label>
+        <label class="field">
+          <span>Call timeout, s <span class="dim">(optional)</span></span>
+          <input type="text" id="mcp-timeout" inputmode="numeric" placeholder="120" spellcheck="false">
+        </label>
+      </div>
+
+      <label class="field">
+        <span>Headers <span class="dim">(one per line: <code>Name: Value</code>)</span></span>
+        <textarea id="mcp-headers" rows="3" spellcheck="false"
+                  placeholder="Authorization: Bearer ${MY_MCP_TOKEN}"></textarea>
+      </label>
+
+      <label class="field">
+        <span>Limit to tools <span class="dim">(optional, comma separated)</span></span>
+        <input type="text" id="mcp-tools" placeholder="web_search, web_fetch" spellcheck="false">
+      </label>
+
+      <label class="mini-field check">
+        <input type="checkbox" id="mcp-enabled" checked>
+        <span>Enabled</span>
+      </label>
+
+      <p class="dim mcp-editor-note" id="mcp-editor-note" hidden></p>
+
+      <div class="kv-row">
+        <button type="submit" class="mini-btn primary" id="mcp-save">Save server</button>
+        <button type="button" class="mini-btn" id="mcp-test">Test connection</button>
+      </div>
+    </form>
+
+    <div class="mcp-add-card">
+      <span class="dim">Anything else you run that speaks MCP over Streamable HTTP.</span>
+      <button class="mini-btn primary" id="mcp-add">Add New Server</button>
+      <button class="mini-btn" id="mcp-reload">Reload MCP</button>
+    </div>
+
+    <h3>Server</h3>
+    <div id="server-info" class="server-info"></div>
+    <div id="tools-info" class="tools-info"></div>
+  </div>
+</section>
+
+<input type="file" id="file-input" accept="image/*,video/*" multiple hidden>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script type="module" src="/assets/app.js"></script>
+</body>
+</html>

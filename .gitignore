@@ -20,7 +20,7 @@ env/
 
 # Frontend
 node_modules/
-dist/
+
 .vite/
 
 # Editors / OS
