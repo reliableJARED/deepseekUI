@@ -63,6 +63,19 @@ MAX_TOOL_STEPS_LIMIT = 100
 #: else entirely: a renders folder, a scratch directory, another drive.
 MEDIA_DISPLAY_ROOTS_VAR = "MEDIA_DISPLAY_ROOTS"
 
+#: Remote media. A URL handed to `display_media` is *probed*, never downloaded: the
+#: server fetches metadata, a poster and a handful of frames, and the player streams
+#: from the origin. These bound what the probe may cost.
+REMOTE_MEDIA_MAX_BYTES_VAR = "REMOTE_MEDIA_MAX_BYTES"
+REMOTE_MEDIA_TIMEOUT_VAR = "REMOTE_MEDIA_TIMEOUT"
+REMOTE_MEDIA_TOTAL_TIMEOUT_VAR = "REMOTE_MEDIA_TOTAL_TIMEOUT"
+REMOTE_FRAMES_MAX_VAR = "REMOTE_FRAMES_MAX"
+#: Permit `localhost` and private addresses. Off by default — see
+#: `remote_media.RemoteLimits.allow_private`.
+REMOTE_MEDIA_ALLOW_PRIVATE_VAR = "REMOTE_MEDIA_ALLOW_PRIVATE"
+#: Turn the local stream proxy off. Playback then goes straight to the origin.
+REMOTE_MEDIA_PROXY_VAR = "REMOTE_MEDIA_PROXY"
+
 __all__ = [
     "Settings",
     "load_settings",
@@ -74,6 +87,12 @@ __all__ = [
     "MIN_TOOL_STEPS",
     "MAX_TOOL_STEPS_LIMIT",
     "MEDIA_DISPLAY_ROOTS_VAR",
+    "REMOTE_MEDIA_MAX_BYTES_VAR",
+    "REMOTE_MEDIA_TIMEOUT_VAR",
+    "REMOTE_MEDIA_TOTAL_TIMEOUT_VAR",
+    "REMOTE_FRAMES_MAX_VAR",
+    "REMOTE_MEDIA_ALLOW_PRIVATE_VAR",
+    "REMOTE_MEDIA_PROXY_VAR",
     "is_usable_key",
     "mask_key",
     "read_env_var",
@@ -186,6 +205,35 @@ class Settings:
     #: Extra directories the media-display tool may read from, on top of the project
     #: directory. See :meth:`display_roots` and ``MEDIA_DISPLAY_ROOTS_VAR``.
     media_display_roots: tuple[Path, ...] = ()
+
+    #: ── remote media ──────────────────────────────────────────────────────────
+    #: Total bytes the server may pull to describe one remote source: metadata, a
+    #: poster and a few sampled frames. Deliberately far below a minute of 1080p
+    #: H.264 (~5 MB at 8 Mbit/s), because a probe that needs more than this is a
+    #: probe reading the source the wrong way. See `server/remote_media.py`.
+    remote_media_max_bytes: int = 24 * 1024 * 1024
+    #: Wall-clock ceiling for one HTTP request against a remote source.
+    remote_media_timeout: float = 20.0
+    #: Wall-clock ceiling for the container-index probe, which walks to the index.
+    remote_media_probe_timeout: float = 45.0
+    #: Wall-clock ceiling for one remote probe *in total*: HTTP metadata, the index,
+    #: the poster and every seek. The individual caps above are per step, and a probe
+    #: that obeyed all of them in turn could still outlive the caller — which in this
+    #: server does not fail a tool call, it drops the whole MCP session.
+    remote_media_total_timeout: float = 90.0
+    #: Ceiling on sampled frames, whatever a tool asks for. Eight is enough to say
+    #: what happens in a clip and cheap enough to be worth saying.
+    remote_frames_max: int = 8
+    #: Longest edge of a stored remote poster or frame.
+    remote_frame_max_dim: int = 512
+    #: Land a local proxy in front of playback. It exists for hosts that refuse a
+    #: browser request but accept one with our headers; turning it off means the
+    #: player talks to the origin directly.
+    remote_media_proxy: bool = True
+    #: Allow `localhost` and LAN URLs. Off by default: the two URLs this tool would
+    #: otherwise be pointed at on a developer's machine all day are this server
+    #: itself and a local model daemon, and neither is a video.
+    remote_media_allow_private: bool = False
 
     #: Values changed at runtime from the settings panel.
     #:
@@ -549,6 +597,14 @@ def load_settings(
         request_timeout=_as_float(var("REQUEST_TIMEOUT"), 300.0),
         mcp_config_path=Path(var("MCP_CONFIG") or PROJECT_ROOT / "mcp.json"),
         media_display_roots=_as_paths(var(MEDIA_DISPLAY_ROOTS_VAR)),
+        remote_media_max_bytes=_as_int(var(REMOTE_MEDIA_MAX_BYTES_VAR), 24 * 1024 * 1024),
+        remote_media_timeout=_as_float(var(REMOTE_MEDIA_TIMEOUT_VAR), 20.0),
+        remote_media_probe_timeout=_as_float(var("REMOTE_MEDIA_PROBE_TIMEOUT"), 45.0),
+        remote_media_total_timeout=_as_float(var("REMOTE_MEDIA_TOTAL_TIMEOUT"), 90.0),
+        remote_frames_max=_as_int(var(REMOTE_FRAMES_MAX_VAR), 8),
+        remote_frame_max_dim=_as_int(var("REMOTE_FRAME_MAX_DIM"), 512),
+        remote_media_proxy=_as_bool(var(REMOTE_MEDIA_PROXY_VAR), True),
+        remote_media_allow_private=_as_bool(var(REMOTE_MEDIA_ALLOW_PRIVATE_VAR), False),
     )
 
     if overrides:

@@ -281,7 +281,7 @@ def merge_text(value: Any) -> str:
                 parts.append(str(block.get("text") or ""))
             elif block.get("type") == "image_url":
                 parts.append("[image]")
-            elif block.get("type") in ("image", "video", "audio"):
+            elif block.get("type") in ("image", "video", "audio", "embed"):
                 parts.append(f"[{block.get('type')}]")
     return " ".join(p for p in parts if p)
 

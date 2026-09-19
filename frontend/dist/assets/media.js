@@ -191,7 +191,10 @@ function normalise(items) {
       continue;
     }
 
-    if (type === 'image' || type === 'video' || type === 'audio') {
+    if (type === 'image' || type === 'video' || type === 'audio' || type === 'embed') {
+      // The remote fields only exist on a block the server marked `source: 'remote'`,
+      // but they are copied unconditionally: `elementForBlock` also receives blocks
+      // straight off the SSE wire, which have never been through here at all.
       out.push({
         type,
         url: String(item.url || ''),
@@ -199,6 +202,19 @@ function normalise(items) {
         mime: String(item.mimeType || item.mime || ''),
         width: item.width,
         height: item.height,
+        // `stream` is a loopback proxy URL when the browser would be refused by the
+        // host directly; it beats `url` for playback and is meaningless for download.
+        stream: String(item.stream || ''),
+        poster: String(item.poster || ''),
+        source: String(item.source || ''),
+        note: String(item.note || ''),
+        caption: String(item.caption || ''),
+        duration: Number(item.duration) || 0,
+        embedUrl: String(item.embed_url || item.embedUrl || ''),
+        provider: String(item.provider || ''),
+        title: String(item.title || ''),
+        author: String(item.author || ''),
+        frames: Array.isArray(item.frames) ? item.frames.map(String) : [],
       });
       continue;
     }
@@ -212,9 +228,32 @@ function normalise(items) {
 
 /** True when a block is an image or video the user should see rendered. */
 export function isMediaBlock(block) {
+  if (!block) return false;
+  // An embed is media the user sees, just not media we hold: the player is a frame
+  // from someone else's origin, so the block is a page URL plus an iframe URL. The
+  // iframe URL is what makes it playable — a page URL with no player behind it falls
+  // through to the file chip, which at least links somewhere.
+  if (block.type === 'embed') return Boolean(block.embed_url || block.embedUrl);
   return (block.type === 'image' && block.url)
     || (block.type === 'video' && block.url)
     || (block.type === 'audio' && block.url);
+}
+
+/** True when a block is an embed we should draw a play affordance for. */
+export function isEmbedBlock(block) {
+  return Boolean(block) && block.type === 'embed';
+}
+
+/** `1:23`, `1h 02m 03s` — the compact form of a duration in seconds. */
+export function durationText(seconds) {
+  const total = Math.round(Number(seconds) || 0);
+  if (total <= 0) return '';
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  if (hours) return `${hours}h ${String(minutes).padStart(2, '0')}m ${String(secs).padStart(2, '0')}s`;
+  if (minutes) return `${minutes}:${String(secs).padStart(2, '0')}`;
+  return `${secs}s`;
 }
 
 /** A one-line description of a document, for the `title` attribute. */
@@ -231,13 +270,73 @@ export function describeBlock(block) {
 function mediaCaption(block) {
   // `caption` is what the tool said it was showing ('the monkey you asked for'), so it
   // beats the filename as the visible label; the filename stays in the title text.
-  const label = block.caption || block.name || (block.type === 'video' ? 'video' : 'image');
-  const detail = [extOf(block.mime, block.name)];
+  const remote = block.source === 'remote';
+  const label = block.caption || block.title || block.name
+    || (block.type === 'video' ? 'video' : block.type === 'embed' ? 'video' : 'image');
+  const detail = [];
+  if (block.type !== 'embed') detail.push(extOf(block.mime, block.name));
   if (block.width && block.height) detail.push(`${block.width}×${block.height}`);
-  const title = [describeBlock(block), block.caption].filter(Boolean).join(' · ');
+  const duration = durationText(block.duration);
+  if (duration) detail.push(duration);
+  const title = [describeBlock(block), block.caption, block.provider].filter(Boolean).join(' · ');
+  // `download` does nothing on a cross-origin URL, so a remote source gets a link
+  // that says what it really does instead: open the original.
+  const action = remote
+    ? `<a href="${escapeHtml(block.url)}" target="_blank" rel="noopener" title="Open the original">↗</a>`
+    : `<a href="${escapeHtml(block.url)}" download title="Download">▼</a>`;
+  const badge = remote
+    ? '<span class="media-badge" title="Streamed from the original URL — nothing was downloaded">remote</span>'
+    : '';
   return `<div class="media-cap"><span title="${escapeHtml(title)}">${escapeHtml(label)}</span>`
-    + `<span class="spacer"></span><a href="${escapeHtml(block.url)}" download title="Download">▼</a>`
+    + badge
+    + `<span class="spacer"></span>${action}`
     + `<span>${escapeHtml(detail.join(' · '))}</span></div>`;
+}
+
+const PLAY_ICON = '<svg class="play-icon" viewBox="0 0 24 24" aria-hidden="true">'
+  + '<path d="M8 5v14l11-7z"/></svg>';
+
+/**
+ * A poster with a play button that becomes the player only when clicked.
+ *
+ * The iframe is not in the DOM until then, and that is the whole point: an embed
+ * loads a complete third-party player, sets cookies and counts a view, and the
+ * transcript is re-rendered every time a turn is sent. Building it on click means a
+ * conversation can hold ten of these and pay for exactly the ones that got played.
+ * It is also why the poster matters — without it there is nothing to look at, so a
+ * provider that publishes no still falls back to naming itself.
+ */
+function embedElement(block) {
+  const source = block.embedUrl || block.embed_url || '';
+  const label = block.title || block.name || `${block.provider || 'video'}`;
+
+  const figure = document.createElement('figure');
+  figure.className = 'media-item media-embed';
+  figure.innerHTML =
+    `<button type="button" class="embed-play"${source ? '' : ' disabled'}`
+    + ` title="Play ${escapeHtml(label)}">`
+    + `${block.poster ? `<img src="${escapeHtml(block.poster)}" alt="" loading="lazy">` : ''}`
+    + '<span class="play-scrim"></span>'
+    + PLAY_ICON
+    + '</button>'
+    + mediaCaption(block);
+
+  const button = figure.querySelector('.embed-play');
+  if (button && source) {
+    button.addEventListener('click', () => {
+      const frame = document.createElement('iframe');
+      frame.className = 'embed-frame';
+      frame.src = source;
+      frame.title = label;
+      frame.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin');
+      // `web-share` is deliberately absent: Chrome dropped it from the allowlist and
+      // now logs an "Unrecognized feature" warning for every player on the page.
+      frame.setAttribute('allow', 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture');
+      frame.setAttribute('allowfullscreen', '');
+      button.replaceWith(frame);
+    });
+  }
+  return figure;
 }
 
 /**
@@ -269,14 +368,23 @@ export function elementForBlock(block, { onZoom = null } = {}) {
     return figure;
   }
 
-  if (block.type === 'video' && block.url) {
+  if (block.type === 'video' && (block.url || block.stream)) {
+    // `stream` first: a proxy URL exists exactly when the browser could not be
+    // pointed at the original. `url` stays the identity of the media — the caption,
+    // the download link and the note the model was given all use it.
+    const src = block.stream || block.url;
     const figure = document.createElement('figure');
     figure.className = 'media-item';
     figure.innerHTML =
-      `<video src="${escapeHtml(block.url)}" controls preload="metadata"`
+      `<video src="${escapeHtml(src)}" controls preload="metadata"`
+      + `${block.poster ? ` poster="${escapeHtml(block.poster)}"` : ''}`
       + `${block.width ? ` width="${Number(block.width)}"` : ''}></video>`
       + mediaCaption(block);
     return figure;
+  }
+
+  if (block.type === 'embed') {
+    return embedElement(block);
   }
 
   if (block.type === 'audio' && block.url) {

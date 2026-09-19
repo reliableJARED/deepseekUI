@@ -19,17 +19,20 @@ user-only: what it shows is never attached to a request.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
 import shutil
 import subprocess
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from deepseek_client.tools import Tool, ToolResult, tool_schema
 
-from .media import DISPLAY_KEY, classify_kind, sniff_mime
+from .media import DISPLAY_KEY, EMBED_TYPE, classify_kind, sniff_mime
+from .remote_media import RemoteLimits, RemoteMedia, RemoteMediaError, is_remote_url, resolve_remote
 from .settings import PROJECT_ROOT
 from .store import ConversationError
 
@@ -48,6 +51,10 @@ MIN_USEFUL_DIM = 544
 #: ``web_media/`` on every call, so a transcript pointing at it would rot — but a
 #: 4 GiB read is not a reasonable side effect of asking to see a file.
 MAX_DISPLAY_BYTES = 256 * 1024 * 1024
+
+#: Floor for a remote frame's size. The API upscales anything below ~544 px while
+#: charging nearly full cost, so a 64 px frame is strictly worse than a 544 px one.
+MIN_REMOTE_DIM = 256
 
 
 def _url_for_attached_name(store, media, uuid: str, name: str) -> str | None:
@@ -202,6 +209,125 @@ def _image_block(store, media, path: Path) -> dict[str, Any]:
     return {"type": "image", "url": _as_media_url(store, path), "name": path.name}
 
 
+# ── remote media ──────────────────────────────────────────────────────────────
+#
+# A URL is handled by `server/remote_media.py`, which probes the source instead of
+# downloading it: metadata from a HEAD, a poster and a few frames from seeks, and a
+# loopback proxy for playback. Everything below is the part that belongs to a tool —
+# deciding what to ask for, and putting what comes back into the conversation.
+
+
+def _remote_limits(settings, *, max_dim: int = 0, max_frames: int = 0) -> RemoteLimits:
+    """Settings, with a tool's own frame arguments applied on top.
+
+    A tool argument beats the setting, but never beats the ceiling: the ceiling is
+    what stops a 20-minute film turning into twelve hundred frames of token bill.
+    """
+    limits = RemoteLimits.from_settings(settings)
+    changes: dict[str, Any] = {}
+    if max_dim and int(max_dim) > 0:
+        changes["frame_max_dim"] = max(MIN_REMOTE_DIM, min(int(max_dim), 2048))
+    if max_frames and int(max_frames) > 0:
+        changes["frames_max"] = min(int(max_frames), limits.frames_max)
+    return replace(limits, **changes) if changes else limits
+
+
+async def _remote_manifest(
+    url: str,
+    *,
+    settings,
+    want_frames: int = 0,
+    target_fps: float = 1.0,
+    poster: bool = True,
+    max_dim: int = 0,
+) -> tuple[RemoteMedia | None, str]:
+    """``(manifest, "")`` or ``(None, why not)``.
+
+    The probe is synchronous and network-bound, so it runs in a worker thread: the
+    engine is a single asyncio loop, and a blocking HTTP read on it would stall every
+    other conversation as well as the turn that asked.
+    """
+    limits = _remote_limits(settings, max_dim=max_dim, max_frames=want_frames)
+    try:
+        manifest = await asyncio.to_thread(
+            resolve_remote,
+            url,
+            limits=limits,
+            want_frames=max(0, int(want_frames)),
+            target_fps=float(target_fps or 1.0),
+            poster=bool(poster),
+        )
+    except RemoteMediaError as exc:
+        return None, str(exc)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a tool handler must not leak a traceback
+        logger.warning("remote probe failed for %s: %s", url, exc)
+        return None, f"could not read {url}: {type(exc).__name__}: {exc}"
+    return manifest, ""
+
+
+def _remote_art(media, uuid: str, manifest: RemoteMedia, *, tag: str) -> tuple[str, list[str]]:
+    """Copy the poster and the frames into the conversation; return their URLs.
+
+    Copied rather than referenced, for the same reason ``display_media`` copies:
+    these are bytes we already have, and a transcript that points at someone else's
+    CDN is a transcript that rots.
+    """
+    poster_url = ""
+    if manifest.poster:
+        poster_url = media.save_bytes(
+            uuid, manifest.poster, "image/jpeg", prefix=f"remote_{tag}_poster"
+        )
+    frame_urls: list[str] = []
+    for index, frame in enumerate(manifest.frames):
+        frame_urls.append(
+            media.save_bytes(uuid, frame, "image/jpeg", prefix=f"remote_{tag}_f{index:03d}")
+        )
+    return poster_url, frame_urls
+
+
+def _remote_token_estimate(manifest: RemoteMedia, settings) -> int:
+    """What it would cost to send this to the model, in tokens.
+
+    The same arithmetic the local branch of ``inspect_media`` uses, so a URL and a
+    downloaded copy of the same clip quote the same price.
+    """
+    if manifest.kind in ("image", "video"):
+        from deepseek_client.messages import image_tokens
+
+        if manifest.kind == "image" and manifest.width and manifest.height:
+            return image_tokens(manifest.width, manifest.height)
+        if manifest.duration and manifest.duration > 0:
+            fps = getattr(settings, "model_video_fps", 1) or 1
+            cap = getattr(settings, "model_video_max_frames", 16) or 16
+            return max(1, min(cap, round(manifest.duration * fps))) * 1024
+    return 0
+
+
+def _frame_blocks(store, media, frame_urls: Sequence[str]) -> list[dict[str, Any]]:
+    """``_image_block``s for frames just written to the conversation."""
+    blocks: list[dict[str, Any]] = []
+    for url in frame_urls:
+        path = media.path_for_url(url)
+        if path is not None:
+            blocks.append(_image_block(store, media, path))
+    return blocks
+
+
+def _remote_label(manifest: RemoteMedia) -> str:
+    """``name (1:23, 1920x1080)`` — whatever of that is known."""
+    parts: list[str] = []
+    if manifest.duration:
+        parts.append(_fmt_duration(manifest.duration))
+    if manifest.width and manifest.height:
+        parts.append(_dims((manifest.width, manifest.height)))
+    if manifest.codec:
+        parts.append(manifest.codec)
+    detail = f" ({', '.join(parts)})" if parts else ""
+    return f"{manifest.name}{detail}"
+
+
 def build_media_tools(
     store,
     media,
@@ -216,6 +342,150 @@ def build_media_tools(
         if not uuid:
             raise ValueError("no active conversation")
         return uuid
+
+    # ── the URL half of display_media ──
+    async def _display_remote(url: str, caption: str, uuid: str) -> ToolResult:
+        """Show something that lives at a URL, without downloading it."""
+        manifest, error = await _remote_manifest(url, settings=settings, poster=True)
+        if manifest is None:
+            return ToolResult.error(error)
+
+        if manifest.kind == "image":
+            # The bytes *are* the picture, so this is the same shape as showing a
+            # local file — the copy is what keeps the transcript working after the
+            # origin moves or deletes it, and what sidesteps a host that refuses a
+            # request without the headers the probe used.
+            mime = manifest.content_type or "image/jpeg"
+            saved = media.save_bytes(
+                uuid, manifest.poster or b"", mime, prefix="remote_image", name=manifest.name
+            )
+            block: dict[str, Any] = {
+                "type": "image",
+                "url": saved,
+                "name": manifest.name,
+                "mime": mime,
+                DISPLAY_KEY: True,
+                "source": "remote",
+            }
+            dims = media.probe_size(manifest.poster or b"")
+            if dims:
+                block["width"], block["height"] = dims
+            if caption:
+                block["caption"] = caption
+            summary = (
+                f"Showing {manifest.name} to the user, fetched from {url} "
+                f"({_fmt_bytes(manifest.bytes_read)} read). It is displayed above your "
+                "reply and is not attached to this request — you cannot see it here."
+                f"\nIts path is {saved}."
+            )
+            if caption:
+                summary += f"\nShown with the caption: {caption}"
+            if manifest.note:
+                summary += f"\n{manifest.note}"
+            return ToolResult(
+                content=[{"type": "text", "text": summary}, block],
+                meta={
+                    "path": saved,
+                    "kind": "image",
+                    "remote": True,
+                    "shown": True,
+                    "url": url,
+                    "bytes_fetched": manifest.bytes_read,
+                },
+            )
+
+        poster_url, _ = _remote_art(media, uuid, manifest, tag="remote")
+        block = manifest.block(poster_url=poster_url)
+        block[DISPLAY_KEY] = True
+        if caption:
+            block["caption"] = caption
+
+        if manifest.kind == EMBED_TYPE:
+            summary = (
+                f"Showing a {manifest.provider or 'video'} player for "
+                f"{manifest.title or manifest.name!r} to the user. The video stays on "
+                f"{manifest.provider or 'the host'}'s servers and is not downloaded — "
+                "the player loads it only when the user presses play."
+                f"\nIts URL is {url}."
+            )
+        else:
+            summary = (
+                f"Showing {_remote_label(manifest)} to the user, streamed from {url} — "
+                "the file was not downloaded, so the player fetches it from the original "
+                f"host. {_fmt_bytes(manifest.bytes_read)} were read to describe it."
+                "\nIt is displayed above your reply and is not attached to this request "
+                "— you cannot see it here."
+                f"\nIts URL is {url}. Call inspect_media on that URL for its details, or "
+                "reduce_video_frames to look at it yourself."
+            )
+        if manifest.note:
+            summary += f"\n{manifest.note}"
+
+        return ToolResult(
+            content=[{"type": "text", "text": summary}, block],
+            meta={
+                "path": url,
+                "kind": manifest.kind,
+                "remote": True,
+                "shown": True,
+                "poster": poster_url,
+                "bytes_fetched": manifest.bytes_read,
+            },
+        )
+
+    # ── the URL half of reduce_video_frames ──
+    async def _frames_remote(
+        url: str, target_fps: float, max_frames: int, max_dim: int, uuid: str
+    ) -> ToolResult:
+        """Sample a remote video into frames the model can actually look at."""
+        wanted = max(1, int(max_frames or 0))
+        manifest, error = await _remote_manifest(
+            url,
+            settings=settings,
+            want_frames=wanted,
+            target_fps=target_fps,
+            poster=True,
+            max_dim=max_dim,
+        )
+        if manifest is None:
+            return ToolResult.error(error)
+
+        if manifest.kind == "audio":
+            facts = json.dumps(manifest.facts(), indent=2)
+            return ToolResult(
+                content=(
+                    f"{url} is an audio file, so there are no frames to sample. Nothing "
+                    "here can be shown to you as an image.\n" + facts
+                ),
+                meta=manifest.facts(),
+            )
+        if manifest.kind == "image":
+            return ToolResult.error(
+                f"{url} is an image, not a video — use display_media to show it to the "
+                "user, or inspect_media for its details."
+            )
+
+        _, frame_urls = _remote_art(media, uuid, manifest, tag="remote")
+        blocks = _frame_blocks(store, media, frame_urls)
+        if not blocks:
+            return ToolResult.error(
+                f"no frames could be decoded from {url}. {manifest.note}".strip()
+            )
+
+        dim = max_dim if max_dim and int(max_dim) > 0 else _remote_limits(settings).frame_max_dim
+        effective = manifest.duration and len(blocks) / manifest.duration
+        rate = f"~{effective:.2f} fps" if effective else f"{len(blocks)} samples"
+        header = (
+            f"{_remote_label(manifest)} — streamed from {url}, not downloaded.\n"
+            f"Sampled {len(blocks)} frames at {rate}, longest edge {dim} px."
+        )
+        if manifest.note:
+            header += f"\n{manifest.note}"
+        header += f"\nEstimated cost: ~{len(blocks) * 1024} tokens for the frames."
+        return ToolResult(
+            content=[{"type": "text", "text": header}, *blocks],
+            meta={"frames": len(blocks), "saved": frame_urls, "remote": True, "url": url},
+        )
 
     # ── resize_image ──
     async def resize_image(path: str, max_dim: int = 1280, quality: int = 88) -> ToolResult:
@@ -316,6 +586,28 @@ def build_media_tools(
     # ── inspect_media ──
     async def inspect_media(path: str = "") -> ToolResult:
         uuid = current()
+
+        if is_remote_url(path):
+            # Metadata only: no poster, no frames. "What is this and what would it
+            # cost" is a question that should be cheap to ask, and it is the question
+            # that decides whether display_media or reduce_video_frames is next.
+            manifest, error = await _remote_manifest(path, settings=settings, poster=False)
+            if manifest is None:
+                return ToolResult.error(error)
+            info: dict[str, Any] = manifest.facts()
+            cost = _remote_token_estimate(manifest, settings)
+            if cost:
+                info["estimated_tokens"] = cost
+                if manifest.kind == "video":
+                    info["note"] = (
+                        info.get("note", "")
+                        + (" " if info.get("note") else "")
+                        + "That is the cost of sampling it into frames for you. Showing it "
+                        "to the user with display_media costs no tokens at all."
+                    ).strip()
+            info["remote"] = True
+            return ToolResult(content=json.dumps(info, indent=2), meta=info)
+
         directory = store.dir(uuid)
 
         if not path:
@@ -435,8 +727,16 @@ def build_media_tools(
         copied into the conversation, marked as user-facing, and cut out of the tool
         result before it is stored, so it renders above the reply and never joins a
         request. The model is told the path instead, which is what it can act on.
+
+        An ``https://`` URL works the same way. It is probed, not downloaded: the
+        player streams the original, and the only bytes that land on disk are the
+        poster. Nothing about it reaches the model.
         """
         uuid = current()
+
+        if is_remote_url(path):
+            return await _display_remote(path, caption, uuid)
+
         try:
             source = _resolve_display(store, media, uuid, path, settings)
         except ValueError as exc:
@@ -503,6 +803,10 @@ def build_media_tools(
         max_dim: int = 512,
     ) -> ToolResult:
         uuid = current()
+
+        if is_remote_url(path):
+            return await _frames_remote(path, target_fps, max_frames, max_dim, uuid)
+
         source = _resolve(store, media, uuid, path)
         probe = _video_probe(source)
         if probe is None:
@@ -729,6 +1033,8 @@ def build_media_tools(
                 "Report a file's kind, size, and estimated token cost — dimensions for an image, "
                 "duration for a video, line count and charset for a text file. Call with no path "
                 "to list every file in this conversation."
+                "A URL works too — for remote video it reports duration and the token cost of sampling it, without downloading."
+                
             ),
             parameters=tool_schema(
                 "inspect_media",
@@ -764,9 +1070,14 @@ def build_media_tools(
         Tool(
             name="reduce_video_frames",
             description=(
-                "Sample frames from a video and return them as images so you can see its content. "
-                "Frames are the expensive part — each costs up to 1024 tokens — so lower target_fps "
-                "or max_frames for long clips. Use this instead of guessing what a video contains."
+                "Sample frames from a video and return them as images so you can see its "
+                "content. Frames are the expensive part — each costs up to 1024 tokens — so "
+                "lower target_fps or max_frames for long clips. Use this instead of guessing "
+                "what a video contains, and use it — not web_fetch — for any video URL: "
+                "https:// links work, including YouTube and Vimeo. Where the stream cannot be "
+                "downloaded, this returns the video's metadata plus the stills that host "
+                "publishes, and says so; YouTube's are at roughly 1/8, 3/8, 5/8 and 7/8 of "
+                "the runtime. It never fetches the stream, so expect no audio or dialogue."
             ),
             parameters=tool_schema(
                 "reduce_video_frames",

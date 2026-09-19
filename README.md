@@ -138,6 +138,10 @@ See `.env.example` for the annotated list. The important ones:
 | `MODEL_TEXT_MAX_CHARS` | `40000` | how much of one attached text file is inlined |
 | `TEXT_CHAR_BUDGET` | `200000` | total attached text per request, newest first |
 | `MAX_TOOL_STEPS` | `8` | tool-call ceiling per turn; editable from Settings |
+| `REMOTE_MEDIA_MAX_BYTES` | `25165824` | total bytes a remote URL may cost before it is refused |
+| `REMOTE_MEDIA_TOTAL_TIMEOUT` | `90` | wall-clock budget for resolving one remote URL |
+| `REMOTE_MEDIA_PROXY` | `true` | stream remote video through a loopback proxy instead of the origin |
+| `REMOTE_MEDIA_ALLOW_PRIVATE` | `false` | allow loopback/LAN URLs as remote media |
 | `CONTEXT_SAFETY_RATIO` | `0.92` | how full the context may get before old turns are dropped |
 
 ### `providers.json`
@@ -519,6 +523,36 @@ every conversation's files at once — those are referred to by their `/memory/<
 is already in scope for the conversation that owns them. Nothing outside those roots is
 reachable, so this is not a general read primitive: it copies bytes into the active conversation,
 it can only produce image/video/audio, and it never feeds a request.
+
+### Remote URLs
+
+`display_media`, `inspect_media` and `reduce_video_frames` accept an `https://…` URL in place of
+a path, so "find a video of X and show it to me" needs no download step first. A URL is resolved
+into a **manifest** — canonical URL, content type, duration, dimensions, a poster frame and a few
+sampled keyframes — and nothing else is written to the conversation:
+
+- Metadata comes from a `HEAD` (falling back to a one-byte ranged `GET` when a host does not
+  allow `HEAD`).
+- Frames come from `ffmpeg -ss <t> -i <url>`, which seeks and decodes one frame at the point it
+  is wanted. `-ss` before `-i` is deliberate: it is what makes the cost of a 20-minute 1080p
+  source a handful of seeks rather than a download. Frames are deduplicated and the sample count
+  scales with duration (`REMOTE_FRAMES_MAX`, default 8; `REMOTE_FRAME_MAX_DIM`, default 512).
+- The player is pointed at the **original URL** when the browser can reach it, and otherwise at
+  a token-guarded loopback proxy that streams the bytes through with the headers the origin
+  wanted. The token is random, the budget on it is only for analysis, and the proxy is bound to
+  `127.0.0.1`. `REMOTE_MEDIA_PROXY=false` turns it off — nothing else changes.
+- A **YouTube or Vimeo URL is never downloaded or decoded at all.** oEmbed supplies the title,
+  author and size, a poster comes from the thumbnail, and the player is an iframe
+  (`youtube-nocookie.com`, `player.vimeo.com`) that only appears when the user presses play.
+  YouTube's own `hq1/2/3.jpg` stills are offered as frames, because they are real frames at real
+  timestamps.
+
+Refusals are specific, because "it did not work" is useless to a model: a login wall, a
+geo-block, a DRM-protected stream, an HLS/DASH playlist (a segmented stream is not a file),
+a content type that is not media, and a source that would cost more than
+`REMOTE_MEDIA_MAX_BYTES` (default 24 MB) each say so in their own words, and say what to do
+instead. `REMOTE_MEDIA_ALLOW_PRIVATE` (default `false`) is what stops a URL from pointing back at
+this machine or the local network.
 
 ---
 

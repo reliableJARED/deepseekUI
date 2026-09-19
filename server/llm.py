@@ -29,7 +29,7 @@ from deepseek_client import DeepSeekClient, DeepSeekError
 from deepseek_client.messages import ensure_tool_pairing, estimate_tokens, sanitize_messages
 from deepseek_client.types import ToolCall
 
-from .media import display_note, split_display_blocks
+from .media import DISPLAY_KEY, display_note, split_display_blocks
 from .rehydrate import MediaBudget, rehydrate, strip_ui_blocks
 
 __all__ = ["ChatEngine", "TurnResult", "compose_system", "sse"]
@@ -609,7 +609,14 @@ def _display_blocks(stored: Mapping[str, Any]) -> list[dict[str, Any]]:
     """The blocks a tool result should show in the UI.
 
     Stored media keeps its ``/memory/...`` URL, so the browser renders the same file
-    the model saw without any base64 crossing the wire.
+    the model saw without any base64 crossing the wire. A remote block keeps its
+    *original* URL plus the few fields that make a player work — the poster, the
+    stream proxy, the embed — which is why this is a whitelist rather than a copy:
+    the stored line is what the model reads, and it must not grow.
+
+    Returns ``[]`` if the content does not parse as a block list. A plain string —
+    a message with no JSON blocks at all — is reported to the caller as no blocks,
+    since there is nothing for the media grid to render.
     """
     content = stored.get("content")
     if not isinstance(content, str):
@@ -631,13 +638,47 @@ def _display_blocks(stored: Mapping[str, Any]) -> list[dict[str, Any]]:
         btype = block.get("type")
         if btype == "text":
             out.append({"type": "text", "text": str(block.get("text") or "")})
-        elif btype in ("image", "video", "audio"):
+            continue
+        if btype == "embed":
             out.append({
-                "type": btype,
+                "type": "embed",
                 "url": block.get("url", ""),
+                "embed_url": block.get("embed_url", ""),
+                "provider": block.get("provider", ""),
+                "title": block.get("title", ""),
+                "author": block.get("author", ""),
+                "poster": block.get("poster", ""),
                 "name": block.get("name", ""),
-                "mime": block.get("mimeType") or block.get("mime") or "",
+                "note": block.get("note", ""),
+                "source": block.get("source", ""),
+                "display": block.get("display", False),
             })
+            continue
+        if btype not in ("image", "video", "audio"):
+            continue
+        shown: dict[str, Any] = {
+            "type": btype,
+            "url": block.get("url", ""),
+            "name": block.get("name", ""),
+            "mime": block.get("mimeType") or block.get("mime") or "",
+        }
+        for key in (
+            "poster",
+            "stream",
+            "duration",
+            "width",
+            "height",
+            "source",
+            "codec",
+            "caption",
+            "note",
+        ):
+            value = block.get(key)
+            if value not in (None, "", 0, False):
+                shown[key] = value
+        if block.get(DISPLAY_KEY):
+            shown[DISPLAY_KEY] = True
+        out.append(shown)
     return out
 
 

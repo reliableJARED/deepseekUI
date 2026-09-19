@@ -821,15 +821,38 @@ class MediaStore:
 #:   the path it is given if it actually needs to look.
 DISPLAY_KEY = "display"
 
+#: A block the user watches inside an `<iframe>` rather than reads from disk: a
+#: YouTube or Vimeo page, where the file is on someone else's server and will stay
+#: there. It carries no media to send upstream, so ``display`` is the only thing that
+#: decides where it goes — but it is a third type, so every test for "is this media"
+#: has to name it.
+EMBED_TYPE = "embed"
+
+#: Block types that carry something a person can look at or listen to.
+MEDIA_BLOCK_TYPES = ("image", "video", "audio", EMBED_TYPE)
+
+
+#: Set on the block of a source that was never downloaded and never will be.
+#: `server/remote_media.py` puts it there; the frontend reads it to label the player.
+REMOTE_KEY = "source"
+REMOTE_VALUE = "remote"
+
+
+def is_remote_block(block: Any) -> bool:
+    """True for a block describing a file that stayed on its own server."""
+    return isinstance(block, dict) and str(block.get(REMOTE_KEY) or "") == REMOTE_VALUE
+
 
 def is_display_block(block: Any) -> bool:
     """True for a media block that is for the user rather than for the model."""
-    return (
-        isinstance(block, dict)
-        and str(block.get("type") or "") in ("image", "video", "audio")
-        and bool(block.get("url"))
-        and bool(block.get(DISPLAY_KEY))
-    )
+    if not isinstance(block, dict) or not block.get(DISPLAY_KEY):
+        return False
+    block_type = str(block.get("type") or "")
+    if block_type == EMBED_TYPE:
+        # An embed has a page URL, not a file URL, so the `url` check below would be
+        # the wrong question to ask it.
+        return bool(block.get("embed_url") or block.get("url"))
+    return block_type in ("image", "video", "audio") and bool(block.get("url"))
 
 
 def split_display_blocks(blocks: Sequence[Any]) -> tuple[list[dict], list[Any]]:
@@ -851,12 +874,9 @@ def mark_display_blocks(blocks: Sequence[Any]) -> list[Any]:
     """
     out: list[Any] = []
     for block in blocks:
-        if (
-            isinstance(block, dict)
-            and str(block.get("type") or "") in ("image", "video", "audio")
-            and block.get("url")
-        ):
-            block = {**block, DISPLAY_KEY: True}
+        if isinstance(block, dict) and str(block.get("type") or "") in MEDIA_BLOCK_TYPES:
+            if block.get("url") or block.get("embed_url"):
+                block = {**block, DISPLAY_KEY: True}
         out.append(block)
     return out
 
@@ -870,6 +890,20 @@ def display_note(block: Mapping[str, Any]) -> str:
     url = str(block.get("url") or "")
     kind = str(block.get("type") or "file")
     name = str(block.get("name") or "") or url.rsplit("/", 1)[-1]
+    if kind == EMBED_TYPE:
+        title = str(block.get("title") or name)
+        provider = str(block.get("provider") or "an embed provider")
+        return (
+            f"[{provider} player for {title!r} was shown to the user. The video itself "
+            f"stays on {provider}'s servers and is not attached here. Its URL is {url} — "
+            "pass that URL to inspect_media to read its metadata.]"
+        )
+    if is_remote_block(block):
+        return (
+            f"[{kind} {name} shown to the user, streamed from its own server and not "
+            f"downloaded. Its URL is {url} — pass that URL to inspect_media or "
+            "reduce_video_frames to look at it.]"
+        )
     return (
         f"[{kind} {name} was shown to the user and is not attached here. "
         f"Its path is {url} — pass that path to inspect_media or read_file to look at it.]"

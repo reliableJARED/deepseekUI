@@ -31,7 +31,7 @@ from typing import Any, Iterable, Sequence
 
 from deepseek_client.messages import image_tokens
 
-from .media import display_note, is_display_block
+from .media import EMBED_TYPE, display_note, is_display_block
 
 __all__ = ["rehydrate", "strip_ui_blocks", "count_images", "MediaBudget"]
 
@@ -249,6 +249,13 @@ def rehydrate(
 
             elif btype == "audio":
                 text_parts.append("[audio output — the model cannot hear this]")
+
+            elif btype == EMBED_TYPE:
+                # Nothing here to inline, marked or not: the video is on the embed
+                # provider's servers and there is no file to sample. A marked embed
+                # was already handled above, so this is an older or hand-edited
+                # transcript — the line is the same either way.
+                text_parts.append(display_note(block))
 
             else:
                 text_parts.append(str(block.get("text") or block.get("url") or ""))

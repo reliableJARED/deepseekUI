@@ -26,7 +26,10 @@ import {
   detectLanguage, highlightLines, highlight, isTextName,
   languageForHint, languageForName, languageLabel, resolveLanguage,
 } from '/assets/highlight.js';
-import { codeBlock, readFileListing, uiKindForFile } from '/assets/media.js';
+import {
+  blocksOf, codeBlock, durationText, elementForBlock, isEmbedBlock, isMediaBlock,
+  readFileListing, uiKindForFile,
+} from '/assets/media.js';
 import {
   API_KEY_HEADER, formatHeaders, parseHeaders, mcpApiKeyOf, mcpHeadersWithoutKey, withApiKey,
 } from '/assets/mcpheaders.js';
@@ -562,6 +565,140 @@ if (API_KEY_HEADER in cleared) fail('an empty key field did not clear the key');
 if (cleared.Accept !== 'json') fail('clearing the key dropped an unrelated header');
 if (Object.keys(mcpHeadersWithoutKey({})) .length !== 0) fail('mcpHeadersWithoutKey on {} is not empty');
 pass('mcpheaders: parse/format round trip, key extraction, key replacement and clearing');
+
+/* ── 9. remote and embed media blocks ─────────────────────────────────────
+   A remote video has two URLs and only one of them can be played: `url` is the
+   original (the identity, and what the caption links to) while `stream` is the
+   loopback proxy that exists exactly when the browser would be refused. Getting
+   that preference backwards is invisible until someone tries to play something.
+   An embed is the opposite case — the bytes are nowhere near us — and its whole
+   contract is that the iframe is built on click and not before. */
+
+const REMOTE_VIDEO = {
+  type: 'video',
+  url: 'https://cdn.example.com/clip.mp4',
+  stream: '/remote/abc123',
+  poster: '/memory/c1/remote_poster_1.jpg',
+  source: 'remote',
+  mime: 'video/mp4',
+  name: 'clip.mp4',
+  duration: 83,
+  width: 1920,
+  height: 1080,
+  caption: '',
+};
+
+const normalised = blocksOf([REMOTE_VIDEO])[0];
+if (!normalised) fail('normalise dropped a remote video block');
+else {
+  if (normalised.stream !== '/remote/abc123') fail(`normalise lost stream: ${normalised.stream}`);
+  if (normalised.poster !== REMOTE_VIDEO.poster) fail('normalise lost the poster');
+  if (normalised.source !== 'remote') fail(`normalise lost source: ${normalised.source}`);
+  if (normalised.duration !== 83) fail(`normalise lost duration: ${normalised.duration}`);
+  if (!isMediaBlock(normalised)) fail('a normalised remote video is not a media block');
+  if (!isMediaBlock(REMOTE_VIDEO)) fail('a raw remote video is not a media block');
+  pass('normalise carries stream, poster, source and duration');
+}
+
+// The predicate runs on both a normalised block and one off the SSE wire, which is
+// snake_case and has never been through `normalise`.
+if (isMediaBlock({ type: 'embed', url: 'https://youtu.be/x' })) fail('an embed with no frame URL counts as media');
+if (!isMediaBlock({ type: 'embed', url: 'https://youtu.be/x', embed_url: 'https://e/x' })) {
+  fail('a raw embed (embed_url) is not a media block');
+}
+if (!isEmbedBlock({ type: 'embed', url: 'https://youtu.be/x' })) fail('isEmbedBlock missed an embed');
+if (isEmbedBlock({ type: 'video', url: '/memory/a.mp4' })) fail('isEmbedBlock matched a video');
+if (isMediaBlock({ type: 'video', url: '' })) fail('a video with no URL counts as media');
+if (isMediaBlock({ type: 'text', text: 'hi' })) fail('text counts as media');
+
+const DURATIONS = [[0, ''], [-3, ''], [7, '7s'], [45, '45s'], [83, '1:23'], [600, '10:00'], [3723, '1h 02m 03s']];
+for (const [seconds, want] of DURATIONS) {
+  const got = durationText(seconds);
+  if (got !== want) fail(`durationText(${seconds}) = ${JSON.stringify(got)}, wanted ${JSON.stringify(want)}`);
+}
+pass('isMediaBlock / isEmbedBlock / durationText');
+
+const remoteFigure = elementForBlock(normalised, {});
+const remoteVideo = remoteFigure.querySelector('video');
+if (!remoteVideo) fail('a remote video produced no <video>');
+else {
+  if (!remoteVideo.getAttribute('src').includes('/remote/abc123')) {
+    fail(`the player used ${remoteVideo.getAttribute('src')}, not the stream URL`);
+  }
+  if (remoteVideo.getAttribute('poster') !== REMOTE_VIDEO.poster) {
+    fail(`poster attribute = ${remoteVideo.getAttribute('poster')}`);
+  }
+  const badge = remoteFigure.querySelector('.media-badge');
+  if (!badge || badge.textContent !== 'remote') fail('a remote video is not labelled remote');
+  const link = remoteFigure.querySelector('.media-cap a');
+  if (!link) fail('the remote caption has no link');
+  else {
+    if (link.getAttribute('download') !== null) fail('a cross-origin URL was given a download attribute');
+    if (link.getAttribute('target') !== '_blank') fail('the remote caption link does not open the original');
+  }
+  const cap = remoteFigure.querySelector('.media-cap').textContent;
+  if (!cap.includes('1920×1080')) fail(`the caption lost the dimensions: ${cap}`);
+  if (!cap.includes('1:23')) fail(`the caption lost the duration: ${cap}`);
+  pass('a remote video plays the stream and labels itself remote');
+}
+
+// The local case has to keep working unchanged: no poster attribute, no badge, and
+// the download affordance stays because a /memory/ URL really is downloadable.
+const localFigure = elementForBlock(blocksOf([{
+  type: 'video', url: '/memory/c1/local.mp4', mime: 'video/mp4', name: 'local.mp4',
+}])[0], {});
+const localVideo = localFigure.querySelector('video');
+if (!localVideo || !localVideo.getAttribute('src').includes('/memory/c1/local.mp4')) {
+  fail('a local video no longer plays its own URL');
+}
+if (localVideo && localVideo.hasAttribute('poster')) fail('a local video grew a poster attribute');
+if (localFigure.querySelector('.media-badge')) fail('a local video is labelled remote');
+const localLink = localFigure.querySelector('.media-cap a');
+if (!localLink || localLink.getAttribute('download') === null) fail('a local video lost its download link');
+pass('a local video is unchanged');
+
+const EMBED = {
+  type: 'embed',
+  url: 'https://www.youtube.com/watch?v=TESTID',
+  embed_url: 'https://www.youtube-nocookie.com/embed/TESTID',
+  provider: 'youtube',
+  title: 'a test video',
+  poster: '/memory/c1/remote_poster_2.jpg',
+  source: 'remote',
+  mime: 'text/html',
+  name: 'youtube',
+};
+const embedFigure = elementForBlock(EMBED, {});
+const play = embedFigure.querySelector('.embed-play');
+if (!play) fail('an embed produced no play affordance');
+if (embedFigure.querySelector('iframe')) fail('an embed built its iframe before anyone clicked');
+const embedPoster = embedFigure.querySelector('.embed-play img');
+if (!embedPoster || embedPoster.getAttribute('src') !== EMBED.poster) fail('the embed poster is missing');
+// An embed block is `source: 'remote'` too, so it carries the badge and its caption
+// names the video rather than the placeholder word "video".
+if (!embedFigure.querySelector('.media-badge')) fail('an embed is not labelled remote');
+const embedCap = embedFigure.querySelector('.media-cap').textContent;
+if (!embedCap.includes('a test video')) fail(`the embed caption = ${embedCap}`);
+if (play) {
+  play.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  const frame = embedFigure.querySelector('iframe');
+  if (!frame) fail('clicking the poster did not build the player');
+  else {
+    if (frame.getAttribute('src') !== EMBED.embed_url) fail(`iframe src = ${frame.getAttribute('src')}`);
+    if (frame.getAttribute('allowfullscreen') === null) fail('the player cannot go fullscreen');
+    if (!/youtube-nocookie/.test(frame.getAttribute('src'))) fail('the player is not the no-cookie host');
+  }
+  if (embedFigure.querySelector('.embed-play')) fail('the poster survived the swap');
+  pass('an embed swaps in its player on click, and only then');
+}
+
+// An embed with no frame URL is not clickable, and must not throw on click.
+const bare = elementForBlock({ type: 'embed', url: 'https://example.com/page' }, {});
+const barePlay = bare.querySelector('.embed-play');
+if (barePlay && !barePlay.disabled) fail('an embed with no frame URL is not disabled');
+if (barePlay) barePlay.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+if (bare.querySelector('iframe')) fail('an embed without a frame URL built a player anyway');
+pass('an embed with no frame URL degrades instead of throwing');
 
 /* ── report ──────────────────────────────────────────────────────────────── */
 
