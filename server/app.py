@@ -22,7 +22,7 @@ from .llm import ChatEngine, make_client_factory
 from .mcp import MCPManager, load_mcp_config
 from .media import MediaStore
 from .routes import create_routes, make_middleware
-from .settings import ensure_env_file, load_environ, load_settings
+from .settings import ensure_env_file, ensure_mcp_file, load_environ, load_settings
 from .store import ConversationStore
 from .tools_builtin import build_media_tools
 
@@ -144,6 +144,16 @@ def build_state(settings=None, **overrides) -> AppState:
         ensure_env_file(settings)
     except OSError as exc:
         logger.warning("could not prepare %s (%s)", settings.env_file, exc)
+
+    # The same argument for `mcp.json`, which matters more because its destination is
+    # git-ignored rather than merely usually-absent: a fresh clone has no file, so the
+    # settings panel opens on an empty server list with no sign that a template was
+    # ever meant to be there. Must run BEFORE the read below, or the first boot would
+    # seed a file it then failed to use. Also non-fatal.
+    try:
+        ensure_mcp_file(settings)
+    except OSError as exc:
+        logger.warning("could not prepare %s (%s)", settings.mcp_config_path, exc)
 
     store = ConversationStore(settings.memory_root)
     media = MediaStore(store)

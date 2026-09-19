@@ -21,6 +21,9 @@ import {
   readFileListing, copyText as copyToClipboard, revokePreview,
 } from './media.js';
 import { detectLanguage, languageForName, languageLabel } from './highlight.js';
+import {
+  formatHeaders, parseHeaders, mcpApiKeyOf, mcpHeadersWithoutKey, withApiKey,
+} from './mcpheaders.js';
 import { prefs, savePrefs, app, currentModel, models, isConfigured, visionBlocked } from './state.js';
 
 const $ = (id) => document.getElementById(id);
@@ -367,7 +370,7 @@ function renderMessage(message, { onEdit = null, onRegenerate = null, isLast = f
 
   if (role === 'user' && onEdit) {
     const edit = h('button', 'icon-btn');
-    edit.title = 'Edit and resend — drops everything after this message';
+    edit.title = 'Edit and resend — puts the message back in the box';
     edit.innerHTML = '<svg viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>';
     edit.addEventListener('click', () => onEdit(message));
     actions.append(edit);
@@ -822,6 +825,43 @@ async function send() {
 
   const uuid = app.conv.uuid;
 
+  // An edit rewrites history: the original message and everything after it are
+  // dropped before the replacement is appended, so it lands where it was. The
+  // rewind is deliberately here and not in the pencil's click handler — clicking
+  // only opens the box, and nothing is destroyed until the user actually sends.
+  const editing = pendingEditFor(uuid);
+  if (editing) {
+    clearPendingEdit();
+    try {
+      await api.truncate(uuid, { keep: editing.index });
+      await loadConversation(uuid, { silent: true });
+    } catch (err) {
+      toast(err.message || 'could not rewind the conversation', 'err');
+      return;
+    }
+    // The message's own media went with it. Re-post it so editing the text of a
+    // screenshot does not silently drop the screenshot; files staged in the
+    // composer now win over the old ones (the user is replacing, not adding).
+    // `editing.media` holds the server's own blocks, not `blocksOf`' output, so
+    // the shapes the ingest recognises survive the round trip (see
+    // `carriedBlocksOf`).
+    if (editing.media.length && !files.length) {
+      const carried = editing.media.slice();
+      if (text) carried.push({ type: 'text', text });
+      try {
+        await api.appendMessage(uuid, carried);
+        await loadConversation(uuid, { silent: true });
+      } catch (err) {
+        toast(err.message || 'could not resend', 'err');
+        return;
+      }
+      input.value = '';
+      autogrow(input);
+      await runTurn({ content: undefined });
+      return;
+    }
+  }
+
   // Files go up first and the message is assembled from their URLs, so all the
   // attachments in one send land in a single user turn rather than several.
   let blocks = [];
@@ -883,6 +923,9 @@ async function send() {
 
 async function regenerate() {
   if (!app.conv || app.streaming) return;
+  // Regenerating cuts the transcript too, so an edit that was waiting to be sent
+  // is abandoned rather than left pointing at an index that no longer exists.
+  if (app.pendingEdit) clearPendingEdit({ clearInput: true });
   const messages = app.conv.messages || [];
   let cut = messages.length;
   while (cut > 0 && messages[cut - 1].role !== 'user') cut -= 1;
@@ -898,7 +941,62 @@ async function regenerate() {
   await runTurn({ content: undefined });
 }
 
-async function editAndResend(message) {
+/** The edit waiting to be sent, if it belongs to this conversation. */
+function pendingEditFor(uuid) {
+  const pending = app.pendingEdit;
+  return pending && uuid && pending.uuid === uuid ? pending : null;
+}
+
+/**
+ * Leave edit mode. Nothing has been written yet, so cancelling is free.
+ *
+ * The composer is only emptied when it still holds the text the pencil put there:
+ * once the user has typed, that text is theirs and must survive a cancel.
+ */
+function clearPendingEdit({ clearInput = false } = {}) {
+  const pending = app.pendingEdit;
+  app.pendingEdit = null;
+  $('composer').classList.remove('editing');
+  if (clearInput && pending && $('input').value === pending.text) {
+    $('input').value = '';
+    autogrow($('input'));
+  }
+  updateComposerNote();
+}
+
+/**
+ * Everything in a message except its prose, exactly as the server sent it.
+ *
+ * `blocksOf` is a *presentation* normaliser: it rewrites our own `_file` blocks
+ * (video, audio, attachments) into bare `video`/`audio`/`file` shapes, turns
+ * `image_url` into `image`, and turns a `_file kind=text` into a `code` block with
+ * no URL. `media.ingest_user_content` only recognises `_file`/`file`/`image_url`
+ * and passes anything else through verbatim, so re-posting normalised blocks loses
+ * what the ingest needs: an attached text or code file comes back unrecognised (and
+ * its bytes would be dropped), and the media is re-sent in a shape the server has
+ * no rule for. The raw blocks keep the round trip faithful; only the text is the
+ * user's to rewrite. Display affordances (`_sources`, `_tool`, …) are not the
+ * message, and `text` is handled separately.
+ */
+function carriedBlocksOf(content) {
+  if (!Array.isArray(content)) return [];
+  return content.filter((block) => {
+    if (!block || typeof block !== 'object') return false;
+    const type = String(block.type || '');
+    if (type === 'text') return false;
+    return !(type.startsWith('_') && type !== '_file');
+  });
+}
+
+/**
+ * Put an earlier user message back in the composer instead of sending it again.
+ *
+ * The pencil used to truncate and resend in one go, which made "edit" a lie: the
+ * text was in the box only for the instant it took `send()` to clear it. Nothing is
+ * destroyed here — the rewind happens in `send()`, so the message can be rewritten
+ * (or the whole thing abandoned) before the transcript is cut.
+ */
+function editAndResend(message) {
   if (!app.conv || app.streaming) return;
   const messages = app.conv.messages || [];
   const index = messages.indexOf(message);
@@ -906,33 +1004,21 @@ async function editAndResend(message) {
 
   const blocks = blocksOf(message.content);
   const text = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('\n\n');
-  const hasMedia = blocks.some(isMediaBlock);
+  const media = carriedBlocksOf(message.content);
+  if (!text && !media.length) { toast('this message has nothing to edit', 'warn'); return; }
 
-  if (!window.confirm('Drop this message and everything after it, then send it again?')) return;
+  if (!window.confirm('Edit this message? Sending the new text drops this message and everything after it.')) return;
 
-  try {
-    await api.truncate(app.conv.uuid, { keep: index });
-  } catch (err) {
-    toast(err.message || 'could not rewind the conversation', 'err');
-    return;
-  }
-
-  if (hasMedia) {
-    // The media blocks have to be re-posted, since their blocks were dropped too.
-    try {
-      await api.appendMessage(app.conv.uuid, blocks);
-      await loadConversation(app.conv.uuid, { silent: true });
-      await runTurn({ content: undefined });
-    } catch (err) {
-      toast(err.message || 'could not resend', 'err');
-    }
-    return;
-  }
-
-  $('input').value = text;
-  autogrow($('input'));
-  $('input').focus();
-  await send();
+  app.pendingEdit = { uuid: app.conv.uuid, index, text, media };
+  const input = $('input');
+  input.value = text;
+  autogrow(input);
+  input.focus();
+  // Cursor at the end, so typing continues the message rather than replacing it.
+  input.setSelectionRange(text.length, text.length);
+  $('composer').classList.add('editing');
+  updateComposerNote();
+  toast(`editing — press ${prefs.enterSends ? 'Enter' : 'Ctrl+Enter'} to send, Esc to cancel`, 'ok', 5000);
 }
 
 /* ── 4. conversations ──────────────────────────────────────────────────── */
@@ -1008,6 +1094,7 @@ function renderList() {
 
 async function createConversation({ focus = true } = {}) {
   const model = currentModel();
+  if (app.pendingEdit) clearPendingEdit({ clearInput: true });
   try {
     const conv = await api.createConversation({
       model: model?.id || '',
@@ -1035,6 +1122,9 @@ async function createConversation({ focus = true } = {}) {
 
 async function loadConversation(uuid, { silent = false, keepScroll = false } = {}) {
   if (app.streaming && !silent) { toast('wait for the current turn to finish', 'warn'); return; }
+  // An edit belongs to the conversation it was started in. Opening another one
+  // abandons it, and nothing has been written, so there is nothing to undo.
+  if (app.pendingEdit && app.pendingEdit.uuid !== uuid) clearPendingEdit({ clearInput: true });
   try {
     const conv = await api.getConversation(uuid);
     app.conv = conv;
@@ -1128,6 +1218,7 @@ async function deleteConversation(conv) {
     // The expansion map is keyed by call id, so it is dead weight once the
     // conversation is gone and there would be nothing left to prune it against.
     if (prefs.expandedTools) delete prefs.expandedTools[conv.uuid];
+    if (app.pendingEdit && app.pendingEdit.uuid === conv.uuid) clearPendingEdit({ clearInput: true });
     if (app.conv && app.conv.uuid === conv.uuid) {
       app.conv = null;
       prefs.lastUuid = '';
@@ -1205,6 +1296,17 @@ function updateComposerNote() {
       + 'If you need one go <a href="https://platform.deepseek.com/sign_up" target="_blank" '
       + 'rel="noopener noreferrer">here</a>, sign up, follow the steps to get a new key and '
       + 'paste it in to the <b>Settings</b> area for Deepseek API key.';
+    return;
+  }
+
+  if (pendingEditFor(app.conv?.uuid)) {
+    note.innerHTML = '<b>Editing an earlier message</b> — sending drops it and everything after it. '
+      + '<a href="#" id="edit-cancel">Cancel</a>';
+    note.querySelector('#edit-cancel').addEventListener('click', (event) => {
+      event.preventDefault();
+      clearPendingEdit({ clearInput: true });
+    });
+    $('send-btn').title = 'Send the edited message';
     return;
   }
 
@@ -1388,6 +1490,7 @@ function revealKey(show) {
 function applyProps(props) {
   app.props = props;
   renderApiKeyStatus();
+  renderToolSteps();
   renderServerInfo();
   populateSelects();
   updateComposerNote();
@@ -1429,6 +1532,47 @@ async function saveApiKey(button) {
   }
 }
 
+/* ── the tool-step ceiling ───────────────────────────────────────────────────
+   A server setting written to .env, like the key, and made live the same way: the
+   route records an override on the one `Settings` instance the engine reads, so the
+   next message uses it. This panel never assumes the write worked — it re-reads
+   /api/props, which is the server's own report of the value now in force. */
+
+function renderToolSteps() {
+  const limits = app.props?.limits;
+  if (!limits) return;
+  const input = $('set-max-tool-steps');
+  // The bounds come from the server rather than the markup, so the two cannot drift.
+  if (limits.min_tool_steps) input.min = limits.min_tool_steps;
+  if (limits.max_tool_steps_limit) input.max = limits.max_tool_steps_limit;
+  input.value = limits.max_tool_steps;
+  $('set-tool-steps-status').textContent = `Currently ${limits.max_tool_steps}.`;
+}
+
+async function saveToolSteps(button) {
+  const input = $('set-max-tool-steps');
+  const value = Number(input.value);
+  if (!Number.isInteger(value)) {
+    toast('tool steps must be a whole number', 'warn');
+    input.focus();
+    return;
+  }
+
+  button.disabled = true;
+  try {
+    const result = await api.setLimits({ max_tool_steps: value });
+    applyProps(await api.props());
+    toast(`tool steps set to ${result.max_tool_steps} — live for the next message`, 'ok');
+  } catch (err) {
+    // Put the field back to the value still in force rather than leaving the
+    // rejected one on screen to be saved again.
+    renderToolSteps();
+    toast(err.message || 'could not save the tool-step limit', 'err', 7000);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function openSettings() {
   $('set-default-system').value = prefs.defaultSystem || '';
   $('set-expand-reasoning').checked = prefs.expandReasoning;
@@ -1440,6 +1584,7 @@ function openSettings() {
   $('set-api-key').value = '';
   revealKey(false);
   renderApiKeyStatus();
+  renderToolSteps();
   renderServerInfo();
   renderMcpStatus({ servers: app.props?.mcp, config: app.props?.mcp_config });
   // Then catch up with anything changed outside the browser, such as a hand edit to
@@ -1502,24 +1647,6 @@ function mcpStore(payload) {
   if (payload && Array.isArray(payload.tools) && app.props) app.props.tools = payload.tools;
 }
 
-function formatHeaders(headers) {
-  return Object.entries(headers || {}).map(([key, value]) => `${key}: ${value}`).join('\n');
-}
-
-/** `Name: Value` per line to an object. Blank lines and `#` comments are ignored. */
-function parseHeaders(text) {
-  const headers = {};
-  for (const raw of String(text || '').split('\n')) {
-    const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
-    const at = line.indexOf(':');
-    const name = at < 0 ? '' : line.slice(0, at).trim();
-    if (!name) throw new Error(`headers must be "Name: Value" — could not read ${line}`);
-    headers[name] = line.slice(at + 1).trim();
-  }
-  return headers;
-}
-
 function mcpAction(label, className, onClick) {
   const button = h('button', `mini-btn${className ? ` ${className}` : ''}`, label);
   button.type = 'button';
@@ -1575,9 +1702,12 @@ function mcpCard(server) {
 
   if (server.url) {
     const prefix = server.toolPrefix || server.prefix;
-    card.append(h('div', 'row2', prefix
+    const line = prefix
       ? `${server.url}  ·  tools appear as ${prefix}__<tool>`
-      : server.url));
+      : server.url;
+    // "works but no key" is the one setup mistake a keyed server cannot report on
+    // its own, so say whether a key is configured right where the URL is shown.
+    card.append(h('div', 'row2', mcpApiKeyOf(server.headers) ? `${line}  ·  key set` : line));
   }
   if (server.error) card.append(h('div', 'mcp-error', server.error));
   if ((server.tools || []).length) {
@@ -1631,7 +1761,8 @@ function openMcpEditor(name = null) {
   $('mcp-prefix').value = server?.prefix || '';
   // Left blank when it is the default, so the placeholder can say what the default is.
   $('mcp-timeout').value = server?.timeout && server.timeout !== 120 ? String(server.timeout) : '';
-  $('mcp-headers').value = formatHeaders(server?.headers);
+  $('mcp-headers').value = formatHeaders(mcpHeadersWithoutKey(server?.headers));
+  $('mcp-api-key').value = mcpApiKeyOf(server?.headers);
   $('mcp-tools').value = (server?.allowedTools || []).join(', ');
   $('mcp-enabled').checked = server ? server.enabled !== false : true;
   mcpNote('');
@@ -1660,10 +1791,14 @@ function mcpFormBody() {
     throw new Error('the timeout must be a number of seconds');
   }
 
+  // The key field always wins, so clearing it really does clear the key rather than
+  // leaving the old one alive in the textarea where nobody would look for it.
+  const headers = withApiKey(parseHeaders($('mcp-headers').value), $('mcp-api-key').value);
+
   const body = {
     name,
     url,
-    headers: parseHeaders($('mcp-headers').value),
+    headers,
     enabled: $('mcp-enabled').checked,
     prefix: $('mcp-prefix').value.trim(),
     // A comma separated list is friendlier to type than a JSON array.
@@ -1858,6 +1993,15 @@ function wire() {
     }
   });
 
+  /* the tool-step ceiling */
+  $('save-tool-steps').addEventListener('click', (event) => saveToolSteps(event.currentTarget));
+  $('set-max-tool-steps').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      saveToolSteps($('save-tool-steps'));
+    }
+  });
+
   $('export-conv').addEventListener('click', exportConversation);
   $('delete-conv').addEventListener('click', () => {
     if (!app.conv) { toast('no conversation is open', 'warn'); return; }
@@ -1876,6 +2020,13 @@ function wire() {
 
   input.addEventListener('input', () => autogrow(input));
   input.addEventListener('keydown', (event) => {
+    // Escape abandons an edit. Nothing has been written yet, so this costs nothing.
+    if (event.key === 'Escape' && pendingEditFor(app.conv?.uuid)) {
+      event.preventDefault();
+      clearPendingEdit({ clearInput: true });
+      toast('edit cancelled', 'warn', 1800);
+      return;
+    }
     if (event.key === 'Enter' && !event.shiftKey && (prefs.enterSends ? !event.ctrlKey : event.ctrlKey)) {
       event.preventDefault();
       form.requestSubmit();

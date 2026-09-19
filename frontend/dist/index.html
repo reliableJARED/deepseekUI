@@ -250,6 +250,22 @@
       follow the steps, then paste the key above.
     </p>
 
+    <h3>Tool use</h3>
+    <p class="dim">
+      Saved to <code>.env</code> and applied to the next message — no restart. Each
+      step is one round trip to the API that re-sends the whole conversation, so this
+      is also a cost control.
+    </p>
+    <label class="field">
+      <span>Maximum tool steps per turn</span>
+      <input type="number" id="set-max-tool-steps" min="1" max="100" step="1"
+             inputmode="numeric" autocomplete="off">
+    </label>
+    <div class="kv-row">
+      <button type="button" class="mini-btn primary" id="save-tool-steps">Save</button>
+      <span class="dim" id="set-tool-steps-status"></span>
+    </div>
+
     <h3>This browser</h3>
     <p class="dim">Stored in <code>localStorage</code>. Nothing here is sent anywhere.</p>
 
@@ -322,6 +338,18 @@
         <textarea id="mcp-headers" rows="3" spellcheck="false"
                   placeholder="Authorization: Bearer ${MY_MCP_TOKEN}"></textarea>
       </label>
+
+      <label class="field">
+        <span>API key <span class="dim">(optional, sent as <code>x-api-key</code>)</span></span>
+        <input type="password" id="mcp-api-key" placeholder="paste the server's API key"
+               spellcheck="false" autocomplete="off">
+      </label>
+      <p class="dim mcp-editor-note mcp-key-note">
+        Stored in plain text in <code>mcp.json</code>, on this machine only, and sent
+        to the server on every call — so a restart is never needed after changing it.
+        The built-in web search server wants a free Gemini key here
+        (<a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer">aistudio.google.com/apikey</a>).
+      </p>
 
       <label class="field">
         <span>Limit to tools <span class="dim">(optional, comma separated)</span></span>

@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -43,6 +43,19 @@ PLACEHOLDER_KEYS = frozenset({
 #: One `NAME=value` line, tolerating `export` and surrounding whitespace.
 _ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
 
+#: The template a first run's ``mcp.json`` is seeded from. Committed; the file it is
+#: copied to is not, because it holds API keys in plain text. Kept next to its
+#: destination rather than at a fixed path, so pointing ``MCP_CONFIG`` at a temp
+#: directory (as the tests do) finds no template and therefore creates nothing.
+MCP_EXAMPLE_NAME = "mcp.example.json"
+
+#: The tool-loop ceiling, which the settings panel can change while the server runs.
+MAX_TOOL_STEPS_VAR = "MAX_TOOL_STEPS"
+#: Bounds the panel enforces. Every step is a full round trip that re-sends the whole
+#: conversation, so a stray zero is a real bill rather than just a slow turn.
+MIN_TOOL_STEPS = 1
+MAX_TOOL_STEPS_LIMIT = 100
+
 __all__ = [
     "Settings",
     "load_settings",
@@ -50,13 +63,20 @@ __all__ = [
     "PROJECT_ROOT",
     "API_KEY_VAR",
     "API_KEY_SIGNUP_URL",
+    "MAX_TOOL_STEPS_VAR",
+    "MIN_TOOL_STEPS",
+    "MAX_TOOL_STEPS_LIMIT",
     "is_usable_key",
     "mask_key",
     "read_env_var",
     "upsert_env_var",
     "ensure_env_file",
+    "MCP_EXAMPLE_NAME",
+    "ensure_mcp_file",
     "set_api_key",
     "api_key_status",
+    "parse_tool_steps",
+    "set_tool_steps",
 ]
 
 
@@ -135,6 +155,27 @@ class Settings:
 
     #: MCP servers, as loaded from `mcp.json` (see `server/mcp.py`).
     mcp_config_path: Path = PROJECT_ROOT / "mcp.json"
+
+    #: Values changed at runtime from the settings panel.
+    #:
+    #: One `Settings` instance is shared by the engine, the route closures and the
+    #: built-in tools, and the dataclass is frozen — so a live change cannot rebind a
+    #: field. Replacing the object would leave every existing holder pointing at the
+    #: old one, which is indistinguishable from a save that silently did nothing. The
+    #: override is recorded here instead, and :meth:`effective` is the read path for
+    #: anything the panel can change. Excluded from equality and hashing so an
+    #: unhashable dict field cannot break the frozen dataclass.
+    runtime: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
+
+    def effective(self, name: str, default: Any = None) -> Any:
+        """The value of ``name`` with any runtime override applied."""
+        if name in self.runtime:
+            return self.runtime[name]
+        return getattr(self, name, default)
+
+    def override(self, **values: Any) -> None:
+        """Record live overrides for the running process. See :attr:`runtime`."""
+        self.runtime.update(values)
 
     def media_root_for(self, uuid: str) -> Path:
         return self.memory_root / uuid
@@ -299,6 +340,47 @@ def ensure_env_file(settings) -> Path | None:
     return path
 
 
+def ensure_mcp_file(settings) -> Path | None:
+    """Give a first run an ``mcp.json``, seeded from ``mcp.example.json``.
+
+    The sibling of :func:`ensure_env_file`, for the same reason: the destination is
+    git-ignored (it stores API keys as plain ``x-api-key`` headers), so a fresh clone
+    has no ``mcp.json`` at all. Without this the settings panel would open on an
+    empty list with nothing to suggest a documented template was ever shipped.
+
+    Returns the path, or ``None`` when there is no template to seed from. An
+    existing ``mcp.json`` is never touched — not even an empty, corrupt, or
+    directory-shaped one. That restraint matters more here than for ``.env``:
+    ``MCPDocument.save`` refuses to overwrite a config it could not parse, so a
+    clobbered file here would leave neither program able to explain what happened.
+
+    The bytes are copied verbatim rather than re-serialised through ``json``, which
+    is what preserves the template's ``_comment`` documentation and its formatting.
+    """
+    if not settings.mcp_config_path:
+        return None
+    path = Path(settings.mcp_config_path)
+    # `exists`, not `is_file`: a directory in the way must stop this too, since
+    # writing over it would raise and creating "around" it makes no sense.
+    if path.exists():
+        return path
+
+    example = path.parent / MCP_EXAMPLE_NAME
+    if not example.is_file():
+        logger.info("no MCP template at %s; not creating %s", example, path)
+        return None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(example.read_bytes())
+    except OSError as exc:
+        # Non-fatal, exactly like ensure_env_file: a read-only checkout still runs,
+        # it simply has nowhere to save a server from the UI.
+        logger.warning("could not create %s from %s (%s)", path, example, exc)
+        return None
+    logger.info("created %s from %s", path, example)
+    return path
+
+
 def set_api_key(settings, key: str) -> Path:
     """Persist ``key`` to `.env` **and** make it live in this process.
 
@@ -311,6 +393,41 @@ def set_api_key(settings, key: str) -> Path:
     os.environ[API_KEY_VAR] = key
     logger.info("stored a new %s in %s", API_KEY_VAR, path)
     return path
+
+
+def parse_tool_steps(value: Any) -> int:
+    """Validate a ``max_tool_steps`` value from the settings panel.
+
+    Raises ``ValueError`` carrying a message the panel can show as-is. The ceiling is
+    the point: each step re-sends the whole conversation, so an accidental extra zero
+    is a real bill, and a panel that silently accepted it would be a trap.
+    """
+    try:
+        steps = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError("tool steps must be a whole number") from None
+    if not MIN_TOOL_STEPS <= steps <= MAX_TOOL_STEPS_LIMIT:
+        raise ValueError(
+            f"tool steps must be between {MIN_TOOL_STEPS} and {MAX_TOOL_STEPS_LIMIT}"
+        )
+    return steps
+
+
+def set_tool_steps(settings, value: Any) -> int:
+    """Persist and apply ``MAX_TOOL_STEPS`` without a restart.
+
+    Three things, for the same reasons :func:`set_api_key` needs three: the value has
+    to reach the file, it has to reach the process environment (``load_env_file``
+    never overrides an entry that is already there, so a stale ``os.environ`` would
+    win on the next boot), and it has to reach the one ``Settings`` instance the
+    engine, the route closures and the built-in tools all already point at.
+    """
+    steps = parse_tool_steps(value)
+    upsert_env_var(settings.env_file, MAX_TOOL_STEPS_VAR, str(steps))
+    os.environ[MAX_TOOL_STEPS_VAR] = str(steps)
+    settings.override(max_tool_steps=steps)
+    logger.info("stored %s=%d in %s", MAX_TOOL_STEPS_VAR, steps, settings.env_file)
+    return steps
 
 
 def api_key_status(settings) -> dict[str, Any]:
@@ -368,7 +485,10 @@ def load_settings(
         text_char_budget=_as_int(var("TEXT_CHAR_BUDGET"), 200_000),
         model_max_images=_as_int(var("MODEL_MAX_IMAGES"), 600),
         context_safety_ratio=_as_float(var("CONTEXT_SAFETY_RATIO"), 0.92),
-        max_tool_steps=_as_int(var("MAX_TOOL_STEPS"), 8),
+        # Clamped to the same ceiling the panel enforces, so ``max_tool_steps`` is
+        # always a value the panel could also have saved. `_as_int` already rejects a
+        # non-positive value by falling back to the default.
+        max_tool_steps=min(_as_int(var(MAX_TOOL_STEPS_VAR), 8), MAX_TOOL_STEPS_LIMIT),
         request_timeout=_as_float(var("REQUEST_TIMEOUT"), 300.0),
         mcp_config_path=Path(var("MCP_CONFIG") or PROJECT_ROOT / "mcp.json"),
     )

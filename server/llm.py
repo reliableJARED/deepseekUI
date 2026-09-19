@@ -255,7 +255,7 @@ class ChatEngine:
             })
             return
 
-        step_limit = max_steps or self.settings.max_tool_steps
+        step_limit = max_steps or self.settings.effective("max_tool_steps")
 
         # Build the tool set: MCP servers plus the built-in media tools.
         registry = None
@@ -411,7 +411,7 @@ class ChatEngine:
                     yield sse("warning", {
                         "message": (
                             f"Stopped after {step_limit} tool steps without a final answer. "
-                            "Raise MAX_TOOL_STEPS or narrow the request."
+                            "Raise the tool-step limit in Settings or narrow the request."
                         )
                     })
 

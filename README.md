@@ -133,10 +133,10 @@ See `.env.example` for the annotated list. The important ones:
 | `HOST` / `PORT` | `127.0.0.1` / `5000` | where to listen |
 | `ALLOW_LAN` | `false` | must be `true` *and* `--lan` to bind off-loopback |
 | `MEDIA_ROOT` | `./memory` | where conversations are written |
-| `MCP_CONFIG` | `./mcp.json` | MCP server list; absent means MCP off |
+| `MCP_CONFIG` | `./mcp.json` | MCP server list; seeded from `mcp.example.json` on a first run |
 | `MODEL_TEXT_MAX_CHARS` | `40000` | how much of one attached text file is inlined |
 | `TEXT_CHAR_BUDGET` | `200000` | total attached text per request, newest first |
-| `MAX_TOOL_STEPS` | `8` | tool-call ceiling per turn |
+| `MAX_TOOL_STEPS` | `8` | tool-call ceiling per turn; editable from Settings |
 | `CONTEXT_SAFETY_RATIO` | `0.92` | how full the context may get before old turns are dropped |
 
 ### `providers.json`
@@ -229,7 +229,9 @@ the key, or leave the list empty, to expose everything the server offers. A sent
 *"the server has this tool but the model never uses it"* usually means it is missing here.
 The names are the **remote** ones: write `read_file`, not `fs__read_file`.
 
-A missing `mcp.json` simply means MCP is off, and the startup log says so.
+A missing `mcp.json` is normal on a first run — it is created from the template for you, see
+[First run: where `mcp.json` comes from](#first-run-where-mcpjson-comes-from). Only if the
+template is gone too is MCP simply off, which the startup log says out loud.
 
 #### Editing servers from the UI
 
@@ -254,6 +256,29 @@ A UTF-8 BOM is tolerated, because Notepad and PowerShell's `Set-Content -Encodin
 write one; saves are written back without it. **Test** probes a server without saving it, which
 is the quickest way to check a URL is reachable before committing it to the file.
 
+#### First run: where `mcp.json` comes from
+
+This file holds API keys in plain text as `x-api-key` headers, so it is **git-ignored** — the
+committed `mcp.example.json` is the template. On a fresh clone there is no `mcp.json` at all,
+and "paste your server into `mcp.json`" is not advice you can follow against a file that does
+not exist. So whichever starts first — the app, or either server in `mcp_server/` — copies the
+template to `mcp.json` once, byte for byte, comments included.
+
+It is a copy and nothing else:
+
+* **An existing `mcp.json` is never touched.** Not empty, not unparseable, not even if it is a
+  directory. A half-finished hand edit is not replaced by the template, and an unreadable file
+  stays unreadable rather than being silently rewritten into something the panel can read.
+* **No template, no file.** Pointing `MCP_CONFIG` at a path whose directory has no
+  `mcp.example.json` creates nothing, which is what keeps the tests hermetic.
+* **Non-fatal.** A read-only checkout still runs; it just has nowhere to save a server.
+* **`mcp.json` is what is read afterwards.** Editing `mcp.example.json` changes nothing once the
+  copy exists — edit `mcp.json`, or use the panel.
+
+Delete both files and MCP is simply off, with the startup log saying so. Both bundled servers
+ship **disabled** in the template: a first run should not open two connections that are certain
+to fail because those processes are not started yet.
+
 #### The bundled example server
 
 `mcp_server/mcpserver.py` is a small self-contained MCP server (Streamable HTTP, port `8572`)
@@ -263,27 +288,67 @@ that exists to exercise the MCP path end to end:
 python mcp_server/mcpserver.py
 ```
 
+Starting it also copies `mcp.example.json` to `mcp.json` if that file is missing, so a fresh
+clone that starts this server first still ends up with the template where the app expects it.
+It never reads that file itself — the app does, and passes the key in as a header.
+
 It exposes two tools:
 
-* **`web_search(query)`** — searches the web and returns a short summarized answer.
+* **`web_search(query)`** — one grounded Gemini call. Gemini runs the search, reads the pages
+  and writes the summary; the source URLs it was grounded on come back underneath, so the
+  answer can be checked and any one of them can be opened with `web_fetch`.
 * **`web_fetch(url)`** — opens a single page and returns its readable text plus content images.
   It needs no search, so it is the right tool whenever you already have an address. A bare
-  domain such as `example.com` is accepted and assumed to be `https`.
+  domain such as `example.com` is accepted and assumed to be `https`. There is **no model in
+  this path**: the page comes back as plain text with its HTML tags removed, and the calling
+  model does the reading and summarising. It can therefore still carry page furniture
+  (navigation, cookie notices); the tool description tells the model to read past it.
 
-Search tries keyed APIs first and falls back to scraping DuckDuckGo. **The scraped fallback is
-not dependable**: DuckDuckGo now answers automated queries with a CAPTCHA page and an HTTP
-`202`, and every other keyless engine is gated as well. When that happens the tool reports
-search as *unavailable* rather than as "no results" — the two are not the same thing, and a
-model told the second will repeat it to you as fact. For dependable search, give the server a
-backend:
+Search needs a Google AI Studio API key — free, no billing account:
+
+1. Get one at <https://aistudio.google.com/apikey>.
+2. In the app, **MCP servers → Edit** on the `manual` entry, and paste it into **API key**.
+   That is stored in `mcp.json` as an `x-api-key` header on that server's entry and sent with
+   every call, so there is nothing to restart after changing it.
+3. Running the server by hand instead? Set `GEMINI_API_KEY` in its environment.
+
+Nothing scrapes a search engine any more. Every keyless engine sits behind a bot filter that
+answers with a `202` challenge page or a `429` rather than an error, and none of those raise —
+so a *throttled* search used to be indistinguishable from an *empty* one and got reported as
+"no results". That is worse than a failure, because it tells you a topic does not exist when
+the truth was that the request was refused. Search now either works or says why it could not,
+and the tool description tells the model to treat "unavailable" as a setup problem rather than
+an absence of coverage.
 
 | Variable | Effect |
 | --- | --- |
-| `BRAVE_API_KEY` | Uses the Brave Search API as the first backend (free tier available). |
-| `SEARXNG_URL` | Uses a self-hosted SearXNG instance's `/search` JSON endpoint. |
+| `GEMINI_SEARCH_MODEL` | The model to ground with. Defaults to `gemini-2.5-flash`. |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Fallback key, when no header reaches the server. |
 
-`web_fetch` is unaffected by any of this and needs no key. Note that search results are
-summarized by the local llama.cpp instance, so that server has to be running.
+`gemini-2.5-flash` is named rather than left to the client because it is the model whose
+Google-Search grounding is free (500 grounded requests/day, shared with `gemini-2.5-flash-lite`);
+a model outside that tier would quietly bill the key's project. **The free tier uses what you
+send and receive to improve Google's products** — do not put anything confidential through it.
+Grounding errors (`API key not valid`, `RESOURCE_EXHAUSTED` for an exhausted quota) are reported
+in plain words instead of as a stack trace.
+
+`web_fetch` needs no key and no second model. It downloads the page, strips the markup, and
+hands back the text and the page's content images as image blocks.
+
+That is a deliberate simplification, not an omission. `web_fetch` used to strip boilerplate
+with the local llama.cpp instance (a 4-way parallel map over chunks, then a reduce), which took
+~135 s on a large page. The MCP client's per-call timeout is 120 s, and a call that outlives
+that budget dooms the session it was sent on — the abandoned request's late response lands on
+the shared connection and the transport reads it as end-of-stream. Every fetch after the first
+large page therefore failed with `Connection closed`, including a bare `example.com` that could
+not fail for any content reason. Fetching is now a download and a tag strip, so it finishes in
+the time the network takes, and reading the page is the calling model's job — which is what it
+is for.
+
+The response to a tool call is **pure JSON** — a single JSON-RPC payload with nothing in front
+of it. (It used to be a run of `.` heartbeat bytes followed by the JSON, which the official MCP
+client cannot parse: it validates the whole body at once, so any call slower than the heartbeat
+failed as if the tool had never answered.)
 
 #### Introspection: the model reading its own source
 
@@ -350,9 +415,18 @@ and would hide the tools you just added:
 The tools then reach the model as `self__introspect`, `self__explain_file` and
 `self__read_source`. The server is not started for you; run it yourself, as above.
 
+Starting it also copies `mcp.example.json` to `mcp.json` if that file is missing — the same
+first-run seeding the app does, because on a fresh clone this is often the first thing you
+start. It uses `INTROSPECTION_ROOT`, so it writes the template into the tree it was pointed at
+and not into whatever directory you happened to launch from. The read-only commands (`--map`,
+`--explain`, `--read`) do **not** seed: inspecting a project should never leave a file behind
+in it.
+
 One implementation detail, in case you write your own client: a slow tool call streams a
-heartbeat, so the response body is a run of `.` characters followed by the JSON — strip
-everything before the first `{` before parsing.
+heartbeat, so *this* server's response body is a run of `.` characters followed by the JSON —
+strip everything before the first `{` before parsing. (`mcp_server/mcpserver.py` does **not**
+do this; its replies are pure JSON, and the official MCP client — which validates the whole
+body at once — depends on that.)
 
 ---
 
@@ -511,13 +585,15 @@ emitted as `event: error` frames the UI renders, rather than crashing the connec
 ## Development
 
 ```powershell
-python -m pytest tests -q      # 373 tests, no network required
+python -m pytest tests -q      # 611 tests, no network required
 ```
 
 The suite covers the wrapper (offline, via `httpx.MockTransport` and a byte-stream that splits
 SSE frames mid-event), the HTTP surface (via `httpx.ASGITransport`), MCP config translation and
-round-tripping, and the media helpers. Nothing is mocked beyond the network boundary itself: the
-store writes real files to a temporary directory, and images are real PNGs.
+round-tripping, the media helpers, and the web-search MCP server. Nothing is mocked beyond the
+network boundary itself: the store writes real files to a temporary directory, images are real
+PNGs, and the search tests replace only `genai.Client` — the canned replies are built through the
+SDK's own `types`, so the attribute names the server reads are asserted against the real ones.
 
 The frontend has no test runner — it is hand-written ES modules loaded straight from
 `frontend/dist/assets/`, so there is nothing to build and nothing to install. Instead there is
@@ -525,9 +601,13 @@ one page, `assets/__selftest.html`, which is deliberately **not** linked from th
 server, open `http://127.0.0.1:5000/assets/__selftest.html`, and check that it says `ALL PASS`
 (`window.__harness` carries the detail). It holds the highlighter to its invariants over a corpus
 of samples — including ones that try to break out with `<span>` and `&amp;` in the source — and
-asserts the file-name resolver, the language detector, the listing recogniser and the code block
-rendering. It earned its place the first time it ran, by finding nine bugs in code that had been
-reviewed and looked clean: **frontend JavaScript has to be executed, not inspected.**
+asserts the file-name resolver, the language detector, the listing recogniser, the code block
+rendering, and the MCP header/API-key rules in `assets/mcpheaders.js`. That last module is
+separate from `app.js` precisely so it can be executed here: a header that fails to survive the
+editor's round trip does not throw, it produces a server that connects and then refuses every
+call, which is indistinguishable from a broken server. It earned its place the first time it ran,
+by finding nine bugs in code that had been reviewed and looked clean: **frontend JavaScript has to
+be executed, not inspected.**
 
 ---
 

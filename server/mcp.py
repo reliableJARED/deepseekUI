@@ -57,6 +57,18 @@ CONNECT_TIMEOUT = 20.0
 #: The same idea for the settings panel's "Test" button.
 PROBE_TIMEOUT = 10.0
 
+#: Grace added to the transport's read timeout on top of a server's per-call budget.
+#: The dispatcher abandons a call at exactly :attr:`MCPServerSpec.timeout`; the socket
+#: read must not fire first, because a socket-level read timeout is raised inside the
+#: task that owns the session and takes the whole transport down with it (see
+#: :meth:`MCPConnection._build_http_client`). A clean per-request timeout has to win.
+TRANSPORT_READ_MARGIN = 30.0
+
+#: ``mcp_types.CONNECTION_CLOSED``: the peer's transport is gone and every later call
+#: will fail instantly. Spelled out rather than imported because ``mcp`` is optional and
+#: is imported lazily.
+CONNECTION_CLOSED_CODE = -32000
+
 #: Lines of per-server history kept for the UI's connection log.
 LOG_LIMIT = 40
 
@@ -484,6 +496,8 @@ class MCPConnection:
         headers = dict(self.spec.headers)
         http_client = None
         if headers:
+            # Only a headers-carrying server builds its own client — and therefore only
+            # such a server used to inherit httpx2's 5-second default timeout.
             self._http_client = http_client = self._build_http_client(headers)
             if http_client is None:
                 self._note("this server sets headers, but httpx2 is not installed")
@@ -533,20 +547,44 @@ class MCPConnection:
         self._note(f"failed — {reason}")
         logger.error("MCP server %r failed to connect — %s", self.spec.name, reason)
 
-    @staticmethod
-    def _build_http_client(headers: Mapping[str, str]):
+    def _build_http_client(self, headers: Mapping[str, str]):
         """An ``httpx2`` client carrying static headers, when that package exists.
 
         ``mcp`` 2.x transports want ``httpx2``, which is a distinct package from the
         ``httpx`` the rest of this project uses. If it is missing we simply skip the
         headers rather than reaching for the wrong client type.
+
+        The timeout is set explicitly, and that is load-bearing rather than tidiness.
+        ``httpx2.AsyncClient`` defaults to **5 seconds for every phase, the read
+        included** — while the transport hands the POST for one tool call to a task in
+        the task group that owns the session. A read timeout therefore does not fail
+        the call; it raises inside that task, takes the transport's task group down with
+        it, and closes the session's read stream. The dispatcher then marks itself
+        closed, so the call in flight *and every call after it* fail with
+        "Connection closed", instantly, with no HTTP status and nothing to act on.
+
+        That default is exactly wrong here, because a server that sets headers is
+        usually one that answers slowly: an API-keyed search or an LLM-backed scrape
+        blows through five seconds every time. The read budget is taken from the
+        server's own per-call timeout plus a margin, so the dispatcher's clean
+        ``REQUEST_TIMEOUT`` always fires before the transport's fatal one.
         """
         try:
             import httpx2
         except ImportError:
             logger.warning("httpx2 unavailable; MCP headers will not be sent")
             return None
-        return httpx2.AsyncClient(headers=dict(headers), follow_redirects=True)
+        read = max(self.spec.timeout, CONNECT_TIMEOUT) + TRANSPORT_READ_MARGIN
+        return httpx2.AsyncClient(
+            headers=dict(headers),
+            follow_redirects=True,
+            timeout=httpx2.Timeout(
+                connect=CONNECT_TIMEOUT,
+                read=read,
+                write=CONNECT_TIMEOUT,
+                pool=CONNECT_TIMEOUT,
+            ),
+        )
 
     async def close(self) -> None:
         stack, self._stack = self._stack, None
@@ -597,6 +635,24 @@ class MCPConnection:
             "log": list(self.log),
         }
 
+    def _lost(self, exc: Exception) -> None:
+        """Record a session whose transport has ended, once.
+
+        Without this the settings panel would keep reporting "connected" while every
+        call failed instantly with "Connection closed" — the least actionable answer
+        there is, because it names nothing the user can do. Marked not-connected so the
+        panel shows the reason and its Reload button is visibly the way out.
+        """
+        if not self.connected:
+            return
+        self.connected = False
+        self.error = (
+            "the server closed the connection — the session is gone until this server "
+            "is reloaded (Reload in the settings panel)"
+        )
+        self._note(f"connection lost — {type(exc).__name__}: {exc}")
+        logger.warning("MCP server %r lost its session mid-call: %s", self.spec.name, exc)
+
     async def call(self, remote_name: str, arguments: Mapping[str, Any] | None = None):
         if self._session is None:
             raise MCPToolError(f"MCP server {self.spec.name!r} is not connected")
@@ -606,6 +662,11 @@ class MCPConnection:
                     remote_name, dict(arguments or {}), read_timeout_seconds=self.spec.timeout
                 )
             except Exception as exc:
+                # A closed connection is terminal: the dispatcher rejects every later
+                # call without sending anything, so the tool is dead until a reconnect.
+                # Anything else (a timeout, an error result) leaves the session usable.
+                if getattr(exc, "code", None) == CONNECTION_CLOSED_CODE:
+                    self._lost(exc)
                 raise MCPToolError(f"{self.spec.name}:{remote_name} failed — {exc}") from exc
         if getattr(result, "is_error", False):
             raise MCPToolError(f"{self.spec.name}:{remote_name} returned an error")

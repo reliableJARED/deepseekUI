@@ -842,3 +842,58 @@ def test_a_fast_tool_call_has_no_heartbeat_dots(client):
                        "params": {"name": "read_source",
                                   "arguments": {"path": "README.md"}}}).text
     assert raw.startswith("{")
+
+
+# ── first run: seeding `mcp.json` ─────────────────────────────────────────────
+# The one write this server performs, and the one documented exception to its
+# read-only rule. No tool can reach it: it runs once, at startup, before a single
+# request is served.
+
+TEMPLATE = '{"servers": [{"name": "self-reflection"}]}\n'
+
+
+def test_ensure_mcp_config_copies_the_template(tmp_path):
+    (tmp_path / "mcp.example.json").write_text(TEMPLATE, encoding="utf-8")
+
+    created = sr.ensure_mcp_config(tmp_path)
+
+    assert created == tmp_path / "mcp.json"
+    assert created.read_text(encoding="utf-8") == TEMPLATE
+
+
+def test_ensure_mcp_config_never_overwrites_an_existing_file(tmp_path):
+    (tmp_path / "mcp.example.json").write_text(TEMPLATE, encoding="utf-8")
+    (tmp_path / "mcp.json").write_text('{"servers": []}', encoding="utf-8")
+
+    assert sr.ensure_mcp_config(tmp_path) is None
+    assert (tmp_path / "mcp.json").read_text(encoding="utf-8") == '{"servers": []}'
+
+
+def test_ensure_mcp_config_without_a_template_creates_nothing(tmp_path):
+    assert sr.ensure_mcp_config(tmp_path) is None
+    assert not (tmp_path / "mcp.json").exists()
+
+
+def test_ensure_mcp_config_defaults_to_the_introspected_root(tmp_path, monkeypatch):
+    """A real run seeds the tree it was pointed at, not the one it happens to run in.
+
+    ``INTROSPECTION_ROOT`` is what ``PROJECT_ROOT`` resolves from, so if this used cwd
+    instead it would write into whatever directory the user launched from — the
+    opposite of the confinement every other code path in this module enforces.
+    """
+    monkeypatch.setattr(sr, "PROJECT_ROOT", tmp_path)
+    (tmp_path / "mcp.example.json").write_text(TEMPLATE, encoding="utf-8")
+
+    assert sr.ensure_mcp_config() == tmp_path / "mcp.json"
+
+
+def test_the_read_only_cli_does_not_seed_mcp_json(tmp_path, monkeypatch):
+    """``--map`` is an inspection command. Leaving a new file behind in a project
+    someone asked you to look at is exactly the surprise this module avoids."""
+    monkeypatch.setattr(sr, "PROJECT_ROOT", tmp_path)
+    (tmp_path / "mcp.example.json").write_text(TEMPLATE, encoding="utf-8")
+
+    assert sr.main(["--map", "--no-llm"]) == 0
+
+    assert not (tmp_path / "mcp.json").exists()
+

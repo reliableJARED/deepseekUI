@@ -31,13 +31,20 @@ from server.app import create_app
 from server.settings import (
     API_KEY_SIGNUP_URL,
     API_KEY_VAR,
+    MAX_TOOL_STEPS_LIMIT,
+    MAX_TOOL_STEPS_VAR,
+    MCP_EXAMPLE_NAME,
+    MIN_TOOL_STEPS,
     api_key_status,
     ensure_env_file,
+    ensure_mcp_file,
     is_usable_key,
     load_settings,
     mask_key,
+    parse_tool_steps,
     read_env_var,
     set_api_key,
+    set_tool_steps,
     upsert_env_var,
 )
 
@@ -47,15 +54,17 @@ MASK = "\u2022" * 8
 
 
 @pytest.fixture(autouse=True)
-def clean_key_environment(monkeypatch):
-    """Pin the key environment.
+def clean_settings_environment(monkeypatch):
+    """Pin the environment the settings routes write to.
 
-    ``set_api_key`` and ``load_environ`` both write to the real ``os.environ``, so
+    ``set_api_key`` and ``set_tool_steps`` both write to the real ``os.environ``, so
     without this a test would pick up whatever the previous one left behind, and the
     developer's own shell would decide whether the "no key" tests pass.
     """
     original = os.environ.get(API_KEY_VAR)
+    original_steps = os.environ.get(MAX_TOOL_STEPS_VAR)
     monkeypatch.delenv(API_KEY_VAR, raising=False)
+    monkeypatch.delenv(MAX_TOOL_STEPS_VAR, raising=False)
     monkeypatch.delenv("ENV_FILE", raising=False)
     yield
     # `delenv` records no undo when the name was already absent, so restore by hand
@@ -64,6 +73,10 @@ def clean_key_environment(monkeypatch):
         os.environ.pop(API_KEY_VAR, None)
     else:
         os.environ[API_KEY_VAR] = original
+    if original_steps is None:
+        os.environ.pop(MAX_TOOL_STEPS_VAR, None)
+    else:
+        os.environ[MAX_TOOL_STEPS_VAR] = original_steps
 
 
 def make_settings(tmp_path: Path, env_file: Path | None = None):
@@ -294,6 +307,125 @@ def test_ensure_env_file_leaves_a_real_key_alone(tmp_path):
     assert read_env_var(settings.env_file, API_KEY_VAR) == OLD_KEY
 
 
+# ── first run: creating `mcp.json` ────────────────────────────────────────────
+
+EXAMPLE_MCP = (
+    '{\n'
+    '  "_comment": ["documentation that must survive the copy"],\n'
+    '  "servers": [\n'
+    '    {"name": "self-reflection", "url": "http://127.0.0.1:8590/mcp"}\n'
+    '  ]\n'
+    '}\n'
+)
+
+
+def make_mcp_settings(tmp_path: Path):
+    """Settings whose ``mcp.json`` lives in ``tmp_path``, never the project's own.
+
+    ``make_settings`` leaves ``mcp_config_path`` at the real project root, which would
+    make every assertion below depend on whether the developer has a config checked
+    out — and could seed or inspect the wrong file entirely.
+
+    The override is a ``Path``, matching the dataclass default: overrides are applied
+    with ``dataclasses.replace``, so a ``str`` here would stay a ``str``.
+    """
+    return load_settings(
+        environ={},
+        env_file=str(tmp_path / ".env"),
+        memory_root=tmp_path / "memory",
+        providers_path=tmp_path / "providers.json",
+        mcp_config_path=tmp_path / "mcp.json",
+    )
+
+
+def test_ensure_mcp_file_seeds_a_first_run_from_the_example(tmp_path):
+    settings = make_mcp_settings(tmp_path)
+    (tmp_path / MCP_EXAMPLE_NAME).write_text(EXAMPLE_MCP, encoding="utf-8")
+    assert not settings.mcp_config_path.exists()
+
+    assert ensure_mcp_file(settings) == settings.mcp_config_path
+
+    # Byte-for-byte, not re-serialised through `json`: the `_comment` block IS the
+    # documentation, and a dumps/loads round trip would keep it only by accident.
+    assert settings.mcp_config_path.read_text(encoding="utf-8") == EXAMPLE_MCP
+
+
+def test_ensure_mcp_file_creates_nothing_without_an_example(tmp_path):
+    """A config with no comments and no servers is worse than no file at all."""
+    settings = make_mcp_settings(tmp_path)
+
+    assert ensure_mcp_file(settings) is None
+    assert not settings.mcp_config_path.exists()
+
+
+def test_ensure_mcp_file_leaves_an_existing_config_alone(tmp_path):
+    settings = make_mcp_settings(tmp_path)
+    (tmp_path / MCP_EXAMPLE_NAME).write_text(EXAMPLE_MCP, encoding="utf-8")
+    settings.mcp_config_path.write_text('{"servers": []}', encoding="utf-8")
+
+    ensure_mcp_file(settings)
+
+    assert settings.mcp_config_path.read_text(encoding="utf-8") == '{"servers": []}'
+
+
+def test_ensure_mcp_file_leaves_an_unparseable_config_alone(tmp_path):
+    """The reason for the restraint: ``MCPDocument.save`` also refuses to overwrite a
+    config it cannot read, so replacing this one would destroy the only copy of a
+    hand edit and leave neither program able to explain where the servers went."""
+    settings = make_mcp_settings(tmp_path)
+    (tmp_path / MCP_EXAMPLE_NAME).write_text(EXAMPLE_MCP, encoding="utf-8")
+    settings.mcp_config_path.write_text("{ not json", encoding="utf-8")
+
+    assert ensure_mcp_file(settings) == settings.mcp_config_path
+    assert settings.mcp_config_path.read_text(encoding="utf-8") == "{ not json"
+
+
+def test_ensure_mcp_file_never_writes_through_a_directory(tmp_path):
+    settings = make_mcp_settings(tmp_path)
+    (tmp_path / MCP_EXAMPLE_NAME).write_text(EXAMPLE_MCP, encoding="utf-8")
+    settings.mcp_config_path.mkdir()
+
+    assert ensure_mcp_file(settings) == settings.mcp_config_path
+    assert settings.mcp_config_path.is_dir()
+
+
+def test_the_shipped_example_is_valid_json_and_is_not_machine_specific():
+    """Guards the template itself, which every fresh clone inherits verbatim."""
+    template = Path(__file__).resolve().parent.parent / MCP_EXAMPLE_NAME
+    data = json.loads(template.read_text(encoding="utf-8"))
+
+    names = [entry["name"] for entry in data["servers"]]
+    assert "self-reflection" in names and "websearch" in names
+
+    # A machine-specific path belongs in the prose explaining an example, never in a
+    # server entry: the entry would be copied into every clone's `mcp.json` and read
+    # back as though the user had written it.
+    entries = json.dumps(data["servers"])
+    for marker in ("C:\\", "C:/", "/Users/", "/home/"):
+        assert marker not in entries, marker
+
+    # `allowedTools` on `self-reflection` would hide all three of its tools (it is a
+    # filter, not a hint) — the exact bug this template's comments warn about.
+    self_entry = next(e for e in data["servers"] if e["name"] == "self-reflection")
+    assert "allowedTools" not in self_entry
+
+
+def test_the_app_seeds_mcp_json_on_a_first_run(tmp_path):
+    """The seeded file must exist BEFORE it is read, or the first boot would write a
+    config it then failed to use."""
+    (tmp_path / MCP_EXAMPLE_NAME).write_text(EXAMPLE_MCP, encoding="utf-8")
+
+    create_app(
+        memory_root=str(tmp_path / "memory"),
+        providers_path=str(write_providers(tmp_path)),
+        env_file=str(tmp_path / "does-not-exist.env"),
+        frontend_dir=str(tmp_path / "frontend"),
+        mcp_config_path=str(tmp_path / "mcp.json"),
+    )
+
+    assert (tmp_path / "mcp.json").read_text(encoding="utf-8") == EXAMPLE_MCP
+
+
 # ── making a saved key live ───────────────────────────────────────────────────
 
 def test_set_api_key_updates_the_process_environment_as_well_as_the_file(tmp_path, monkeypatch):
@@ -440,3 +572,127 @@ async def test_props_exposes_the_key_status_to_the_ui(key_client):
     assert body["api_key"]["present"] is True
     assert body["api_key"]["masked"] == MASK + OLD_KEY[-4:]
     assert body["api_key"]["signup_url"] == API_KEY_SIGNUP_URL
+
+
+# ── the tool-step ceiling ─────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("value,expected", [
+    (8, 8),
+    ("8", 8),
+    (" 12 ", 12),
+    (MIN_TOOL_STEPS, MIN_TOOL_STEPS),
+    (MAX_TOOL_STEPS_LIMIT, MAX_TOOL_STEPS_LIMIT),
+])
+def test_parse_tool_steps_accepts_a_whole_number_in_range(value, expected):
+    assert parse_tool_steps(value) == expected
+
+
+@pytest.mark.parametrize("value", [
+    "", "   ", None,
+    "eight", 8.5, "8.0",          # not a whole number
+    0, -1,                        # nothing to run
+    MAX_TOOL_STEPS_LIMIT + 1,     # a stray zero is a real bill, not just a slow turn
+])
+def test_parse_tool_steps_rejects_anything_else(value):
+    with pytest.raises(ValueError):
+        parse_tool_steps(value)
+
+
+def test_a_runtime_override_is_live_but_does_not_change_equality(tmp_path):
+    """`runtime` is excluded from comparison, so the frozen dataclass stays hashable."""
+    first = make_settings(tmp_path)
+    second = make_settings(tmp_path)
+    assert first == second
+
+    first.override(max_tool_steps=30)
+
+    assert first == second                        # the override is not identity
+    assert first.effective("max_tool_steps") == 30
+    assert second.effective("max_tool_steps") == 8
+    assert hash(first) == hash(second)
+
+
+def test_set_tool_steps_writes_the_file_the_environment_and_the_live_instance(tmp_path, monkeypatch):
+    """All three, for the same reason the key needs all three.
+
+    The environment half is the one that bites: `load_env_file` never overrides an
+    entry that is already there, so a save that only wrote the file would be silently
+    undone by the next `load_settings` — the process would keep the value it booted
+    with and the panel would look like it had saved nothing.
+    """
+    settings = make_settings(tmp_path)
+    settings.env_file.write_text(f"{MAX_TOOL_STEPS_VAR}=8\n", encoding="utf-8")
+    monkeypatch.setenv(MAX_TOOL_STEPS_VAR, "8")   # what the process booted with
+
+    assert set_tool_steps(settings, 20) == 20
+
+    assert read_env_var(settings.env_file, MAX_TOOL_STEPS_VAR) == "20"
+    assert os.environ[MAX_TOOL_STEPS_VAR] == "20"
+    # Live: the shared instance reports the new value with nothing to restart.
+    assert settings.effective("max_tool_steps") == 20
+
+    reloaded = load_settings(
+        environ={}, env_file=str(settings.env_file),
+        memory_root=tmp_path / "memory", providers_path=tmp_path / "providers.json",
+    )
+    assert reloaded.max_tool_steps == 20
+
+
+def test_set_tool_steps_leaves_everything_alone_when_the_value_is_rejected(tmp_path):
+    settings = make_settings(tmp_path)
+    settings.env_file.write_text(f"{MAX_TOOL_STEPS_VAR}=8\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        set_tool_steps(settings, 10_000)
+
+    assert read_env_var(settings.env_file, MAX_TOOL_STEPS_VAR) == "8"
+    assert settings.effective("max_tool_steps") == 8
+
+
+async def test_get_limits_reports_the_ceiling_and_its_bounds(tmp_path):
+    app = build_app(tmp_path)
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            body = (await c.get("/api/settings/limits")).json()["limits"]
+
+    assert body["max_tool_steps"] == 8
+    assert body["min_tool_steps"] == MIN_TOOL_STEPS
+    assert body["max_tool_steps_limit"] == MAX_TOOL_STEPS_LIMIT
+
+
+async def test_posting_a_limit_changes_what_the_next_turn_will_use(tmp_path):
+    """The point of the panel: saved, and live for the next message."""
+    app = build_app(tmp_path)
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            assert (await c.get("/api/props")).json()["limits"]["max_tool_steps"] == 8
+
+            response = await c.post("/api/settings/limits", json={"max_tool_steps": 15})
+            assert response.status_code == 200, response.text
+            assert response.json()["max_tool_steps"] == 15
+
+            # The engine and the props payload read the same instance, so both move.
+            live = (await c.get("/api/props")).json()["limits"]
+            assert live["max_tool_steps"] == 15
+            assert app.state.app_state.engine.settings.effective("max_tool_steps") == 15
+
+            assert read_env_var(tmp_path / ".env", MAX_TOOL_STEPS_VAR) == "15"
+
+
+async def test_posting_a_bad_limit_is_refused_and_changes_nothing(tmp_path):
+    app = build_app(tmp_path)
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            missing = await c.post("/api/settings/limits", json={})
+            too_big = await c.post("/api/settings/limits", json={"max_tool_steps": 10_000})
+            not_a_number = await c.post("/api/settings/limits", json={"max_tool_steps": "lots"})
+
+            assert missing.status_code == 400
+            assert too_big.status_code == 400
+            assert not_a_number.status_code == 400
+
+            # A rejected save must not disturb the value still in force.
+            assert (await c.get("/api/props")).json()["limits"]["max_tool_steps"] == 8

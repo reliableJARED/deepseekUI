@@ -1,9 +1,14 @@
 {
   "_comment": [
-    "MCP servers for deepseekUI. Copy to `mcp.json` and edit.",
+    "TEMPLATE for mcp.json, which is git-ignored because it holds API keys in",
+    "plain text. You normally do not copy this by hand: whichever starts first —",
+    "the app, or either server in mcp_server/ — copies this file to `mcp.json`",
+    "verbatim, once, if `mcp.json` is missing. After that `mcp.json` is what is",
+    "read, so editing THIS file changes nothing. Edit `mcp.json` instead, or use",
+    "Settings -> MCP servers.",
     "",
     "You can also edit all of this from Settings -> MCP servers, which writes back",
-    "to this file in place. Editing by hand still works: press Reload afterwards.",
+    "to that file in place. Editing by hand still works: press Reload afterwards.",
     "",
     "Either shape is accepted, and whichever you write is the shape saved back:",
     "  {\"servers\": [ ... ]}        a list, as below",
@@ -23,7 +28,15 @@
     "`self-reflection` is deepseekUI's own source, read-only. It is NOT started for",
     "you: run `python mcp_server/self_reflection.py` first, then set `enabled` to true.",
     "It exposes self__introspect, self__explain_file and self__read_source. Do not add",
-    "`allowedTools` there: that key is a filter, and anything unlisted is hidden."
+    "`allowedTools` there: that key is a filter, and anything unlisted is hidden.",
+    "",
+    "An API key goes in `headers` as `x-api-key` — the Settings panel gives that one",
+    "header its own password field, and shows whether a server has one. It is sent",
+    "with every call, so the server can read it per request instead of at startup;",
+    "changing it needs no restart. It is stored here in plain text.",
+    "",
+    "`mcp_server/mcpserver.py` (web_search + web_fetch) wants a free Gemini key there,",
+    "from aistudio.google.com/apikey — see the `websearch` entry below."
   ],
 
   "servers": [
@@ -49,6 +62,16 @@
       "url": "http://127.0.0.1:8590/mcp",
       "enabled": false,
       "prefix": "self"
+    },
+    {
+      "name": "websearch",
+      "url": "http://127.0.0.1:8572/mcp",
+      "headers": {
+        "x-api-key": "GET_FREE_KEY_FROM_aistudio.google.com/apikey"
+      },
+      "enabled": false,
+      "allowedTools": ["web_search", "web_fetch"],
+      "prefix": "web"
     }
   ]
 }

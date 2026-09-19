@@ -14,7 +14,12 @@ against the real code instead of a guess:
 Design rules, deliberately kept strict:
 
 * **Read-only.** No tool writes, moves, renames, or executes anything. This
-  process is a window, not a hand.
+  process is a window, not a hand. The one exception is at startup, before any
+  request is served: a missing ``mcp.json`` is seeded from ``mcp.example.json``
+  (see ``ensure_mcp_config``) so that a fresh clone finds the MCP template where
+  the app expects it. No tool can reach that code, the read-only commands
+  (``--map``/``--explain``/``--read``) do not trigger it, and nothing else in the
+  tree is ever written.
 * **Confined to the project root.** Every path is resolved and then checked
   against ``PROJECT_ROOT``; anything outside is refused, including symlink
   escapes. ``memory/`` (other people's conversations) and any dotenv or key
@@ -77,6 +82,36 @@ MAX_OUTLINE_SIG = 160          # characters of a signature
 MAX_DOC_LINE = 150             # characters of a one-line docstring
 MAX_SUMMARY_INPUT = 60_000     # characters handed to the summariser
 MAX_SUMMARY_TOKENS = 1_600
+
+# The only thing this server ever writes, and only at startup. Committed template in;
+# git-ignored ``mcp.json`` out. The name sits beside its destination rather than at a
+# fixed path so that pointing INTROSPECTION_ROOT at a source tree without a template
+# (which is what the tests do) quietly does nothing.
+MCP_CONFIG_NAME = "mcp.json"
+MCP_EXAMPLE_NAME = "mcp.example.json"
+
+
+def ensure_mcp_config(root: Path | None = None) -> Path | None:
+    """Give a first run an ``mcp.json``, seeded from the committed example.
+
+    Returns the path it created, or ``None`` when there was nothing to do — an
+    existing ``mcp.json``, or no template to copy from. Never raises: this process
+    exists to inspect a project, so being unable to write must not stop it serving.
+    """
+    root = Path(root) if root else PROJECT_ROOT
+    config = root / MCP_CONFIG_NAME
+    if config.exists():
+        return None
+    example = root / MCP_EXAMPLE_NAME
+    if not example.is_file():
+        return None
+    try:
+        config.write_bytes(example.read_bytes())
+    except OSError as exc:
+        print(f"could not create {config} from {example} ({exc})")
+        return None
+    print(f"Created {config} from {example}")
+    return config
 
 # Directories never walked. Not a security boundary (that is _resolve_path),
 # just noise control — plus memory/, which is other people's conversations.
@@ -1365,6 +1400,12 @@ def main(argv: list[str] | None = None) -> int:
             blocks = call_tool("introspect", {"include": parsed.include}, engine)
         print("\n".join(block["text"] for block in blocks))
         return 0
+
+    # Serving, so it owns mcp.json's first run. Kept out of the branch above on
+    # purpose: `--map` and friends are read-only commands, and leaving a new file in
+    # a project someone asked you to inspect is exactly the kind of surprise this
+    # module was written to avoid.
+    ensure_mcp_config()
 
     print(f"Self-reflection MCP server on http://127.0.0.1:{parsed.port}/mcp")
     print(f"Project root        : {PROJECT_ROOT}")

@@ -36,6 +36,19 @@
           "maxInputTokens": 1000000,
           "maxOutputTokens": 393216
         }
+        ,
+     {
+          "id": "Qwen-Local",
+          "name": "Qwen-Local",
+          "url": "http://localhost:8080",
+          "toolCalling": true,
+          "vision": true,
+          "thinking": true,
+          "reasoningEffort": "high",
+          "strictTools": true,
+          "maxInputTokens": 1000000,
+          "maxOutputTokens": 393216
+        }
       ]
     }
   ]

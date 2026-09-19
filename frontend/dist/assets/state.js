@@ -81,6 +81,7 @@ export const app = {
   attachments: [],         // staged File objects
   lastUserText: '',
   turnError: null,         // {uuid, message, hint} from the last failed turn
+  pendingEdit: null,       // {uuid, index, text, media} — a message loaded for rewriting
   booted: false,
 };
 

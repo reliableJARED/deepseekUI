@@ -27,6 +27,9 @@ import {
   languageForHint, languageForName, languageLabel, resolveLanguage,
 } from '/assets/highlight.js';
 import { codeBlock, readFileListing, uiKindForFile } from '/assets/media.js';
+import {
+  API_KEY_HEADER, formatHeaders, parseHeaders, mcpApiKeyOf, mcpHeadersWithoutKey, withApiKey,
+} from '/assets/mcpheaders.js';
 
 const lines = [];
 let failures = 0;
@@ -506,6 +509,61 @@ for (const [name, type, want] of fileCases) {
 pass(`uiKindForFile over ${fileCases.length} files`);
 
 /* ── report ─────────────────────────────────────────────────────────── */
+
+/* ── 8. mcpheaders ───────────────────────────────────────────────────────── */
+
+// The header text<->object rules, and the API key's special case in them. This is
+// the part of the MCP editor that fails silently: a header that does not survive the
+// round trip produces a server that connects and then refuses every call, which
+// reads as "the server is broken" rather than "the editor dropped your key".
+const parsed = parseHeaders('Authorization: Bearer abc\n\n# a comment\nAccept: application/json\n');
+if (parsed.Authorization !== 'Bearer abc') fail(`parseHeaders kept ${JSON.stringify(parsed.Authorization)}`);
+if (parsed.Accept !== 'application/json') fail('parseHeaders dropped or mangled a header');
+if (Object.keys(parsed).length !== 2) fail(`parseHeaders kept ${Object.keys(parsed).length} headers, wanted 2`);
+
+// A value may contain colons (a URL, a timestamp); only the first one splits.
+const colon = parseHeaders('X-Where: https://example.com:8443/path');
+if (colon['X-Where'] !== 'https://example.com:8443/path') fail(`colon value = ${colon['X-Where']}`);
+
+// A line the parser cannot read must throw, not vanish: silently dropping a header
+// the user typed is the failure this module exists to prevent.
+let threw = false;
+let message = '';
+try {
+  parseHeaders('this is not a header');
+} catch (err) {
+  threw = true;
+  message = err.message;
+}
+if (!threw) fail('parseHeaders accepted a line with no colon');
+if (threw && !message.includes('this is not a header')) fail('the parse error does not name the bad line');
+
+// Everything except the key survives the editor's round trip unchanged.
+const full = { Authorization: 'Bearer abc', Accept: 'application/json', 'x-api-key': 'K' };
+const shown = formatHeaders(mcpHeadersWithoutKey(full));
+if (shown.includes('K')) fail(`the key leaked into the headers textarea: ${shown}`);
+const roundTrip = withApiKey(parseHeaders(shown), 'K');
+if (JSON.stringify(roundTrip) !== JSON.stringify(full)) {
+  fail(`round trip lost something: ${JSON.stringify(roundTrip)} != ${JSON.stringify(full)}`);
+}
+
+// The key field always wins, and cleaning the field always clears the key — the old
+// one must not survive in the textarea under a different spelling.
+if (mcpApiKeyOf({ 'X-API-Key': 'k' }) !== 'k') fail('mcpApiKeyOf is case sensitive');
+if (mcpApiKeyOf({ Accept: 'x' }) !== '') fail('mcpApiKeyOf invented a key');
+if (mcpApiKeyOf({}) !== '') fail('mcpApiKeyOf on {} is not empty');
+const replaced = withApiKey({ 'X-Api-Key': 'old', Accept: 'json' }, 'new');
+const spellings = Object.keys(replaced).filter((name) => name.toLowerCase() === API_KEY_HEADER);
+if (spellings.length !== 1) fail(`withApiKey left ${spellings.length} spellings of the key header`);
+if (replaced[API_KEY_HEADER] !== 'new') fail(`withApiKey kept ${replaced[API_KEY_HEADER]}`);
+if (replaced.Accept !== 'json') fail('withApiKey dropped an unrelated header');
+const cleared = withApiKey({ 'x-api-key': 'old', Accept: 'json' }, '');
+if (API_KEY_HEADER in cleared) fail('an empty key field did not clear the key');
+if (cleared.Accept !== 'json') fail('clearing the key dropped an unrelated header');
+if (Object.keys(mcpHeadersWithoutKey({})) .length !== 0) fail('mcpHeadersWithoutKey on {} is not empty');
+pass('mcpheaders: parse/format round trip, key extraction, key replacement and clearing');
+
+/* ── report ──────────────────────────────────────────────────────────────── */
 
 lines.unshift(failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`);
 document.getElementById('out').textContent = lines.join('\n');

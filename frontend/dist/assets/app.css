@@ -694,6 +694,9 @@ code, pre, .mono { font-family: var(--mono); font-size: .87em; }
 }
 .composer:focus-within { border-color: var(--accent-line); }
 .composer.dragover { border-color: var(--accent); background: var(--accent-soft); }
+/* Editing an earlier message is a different mode from composing a new one: the
+   accent border is the only thing on screen that says the next Enter rewinds. */
+.composer.editing { border-color: var(--accent); }
 
 .composer-row { display: flex; align-items: flex-end; gap: 6px; padding: 8px 8px 6px 11px; }
 #input {
@@ -963,6 +966,10 @@ code, pre, .mono { font-family: var(--mono); font-size: .87em; }
 }
 .mcp-editor-note.ok { border-left-color: var(--ok); background: color-mix(in srgb, var(--ok) 10%, transparent); }
 .mcp-editor-note.bad { border-left-color: var(--err); background: color-mix(in srgb, var(--err) 11%, transparent); }
+/* Sits directly under the field it explains, so pull it up past that field's own
+   bottom margin instead of leaving a gap that reads as a separate section. */
+.mcp-key-note { margin: -3px 0 11px; }
+.mcp-key-note a { color: var(--accent-line); }
 
 .mcp-add-card {
   display: flex; flex-direction: column; align-items: center; gap: 8px;

@@ -1,12 +1,17 @@
-"""Tests for MCP config loading and result translation.
+"""Tests for MCP config loading, result translation, and the live transport.
 
-The connection itself needs a live server, but everything up to the socket is pure
-translation and is where the misconfigurations actually happen.
+Most of what goes wrong is pure translation and needs no socket. The transport's
+behaviour — its timeouts, and what happens to a session when one fires — only exists
+over a real socket, so a handful of tests here run a minimal Streamable HTTP server
+on a real port.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
+import socket
 from pathlib import Path
 
 import pytest
@@ -16,6 +21,7 @@ from server.mcp import (
     MCPConnection,
     MCPServerSpec,
     MCPManager,
+    MCPToolError,
     build_registry,
     load_mcp_config,
     read_mcp_document,
@@ -570,4 +576,161 @@ async def test_a_manager_without_a_path_keeps_the_specs_it_was_given():
     spec = MCPServerSpec(name="a", url="http://127.0.0.1:1/mcp")
     manager = MCPManager([spec])
     assert manager.load_specs() == [spec]
+
+
+# ── the transport, over a real socket ─────────────────────────────────────────
+#
+# These are the only tests here that cannot be pure translation: the SDK's transport
+# spawns the POST for a tool call into the task group that owns the session, so a
+# socket-level timeout inside that POST does not fail the call — it kills the
+# session. Nothing about that is visible through an ASGI-level client.
+
+_TOOLS = [
+    {"name": "slow", "description": "waits, then answers",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "fast", "description": "answers at once",
+     "inputSchema": {"type": "object", "properties": {}}},
+]
+
+
+class StubServer:
+    """A minimal Streamable HTTP MCP server, on a real port."""
+
+    def __init__(self, url: str, task, server) -> None:
+        self.url = url
+        self._task = task
+        self._server = server
+
+    async def stop(self) -> None:
+        self._server.should_exit = True
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._task, timeout=10)
+
+
+@contextlib.asynccontextmanager
+async def live_mcp_server(*, slow_seconds: float = 0.0):
+    """Serve one `slow` tool and one `fast` tool over Streamable HTTP."""
+    uvicorn = pytest.importorskip("uvicorn")
+    from starlette.applications import Starlette
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse, Response
+    from starlette.routing import Route
+
+    async def handler(request: Request):
+        if request.method in ("GET", "OPTIONS"):
+            return Response(status_code=204)
+        body = await request.json()
+        method, request_id = body.get("method"), body.get("id")
+        if method == "initialize":
+            return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": {
+                "protocolVersion": "2025-03-26",
+                "serverInfo": {"name": "stub", "version": "1"},
+                "capabilities": {"tools": {}},
+            }})
+        if method == "notifications/initialized":
+            return Response(status_code=204)
+        if method == "tools/list":
+            return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": {"tools": _TOOLS}})
+        if method == "tools/call":
+            name = body["params"]["name"]
+            if name == "slow":
+                await asyncio.sleep(slow_seconds)
+            return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": {
+                "content": [{"type": "text", "text": f"{name} ok"}], "isError": False,
+            }})
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": request_id,
+             "error": {"code": -32601, "message": f"Method not found: {method}"}},
+            status_code=404,
+        )
+
+    app = Starlette(routes=[Route("/mcp", handler, methods=["POST", "GET", "OPTIONS"])])
+    # Bind-and-release to get a port nothing else is using; uvicorn then takes it.
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    task = asyncio.create_task(server.serve())
+    try:
+        for _ in range(400):
+            if server.started:
+                break
+            await asyncio.sleep(0.025)
+        assert server.started, "the stub server never came up"
+        yield StubServer(f"http://127.0.0.1:{port}/mcp", task, server)
+    finally:
+        server.should_exit = True
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(task, timeout=10)
+
+
+def headers_spec(url: str, **kwargs) -> MCPServerSpec:
+    """A spec that carries a header, which is what forces our own HTTP client.
+
+    Every API-keyed server looks like this, and that is not incidental: a server
+    that needs a key is usually one that answers slowly.
+    """
+    return MCPServerSpec(name="stub", url=url, headers={"x-api-key": "test"}, **kwargs)
+
+
+async def test_a_slow_tool_call_does_not_take_the_session_down_with_it():
+    """The httpx2 default read timeout is 5 s; a slow API-keyed tool exceeds it.
+
+    Before the timeout was set explicitly this failed at 5.0 s with "Connection
+    closed", and the *next* call failed instantly too — the session was already gone.
+    """
+    async with live_mcp_server(slow_seconds=6.0) as stub:
+        connection = MCPConnection(headers_spec(stub.url, timeout=120.0))
+        await connection.connect()
+        try:
+            assert connection.connected, connection.error
+            slow = await connection.call("slow", {})
+            assert slow.content[0].text == "slow ok"
+            # The point of the test: the session survived the slow call.
+            fast = await connection.call("fast", {})
+            assert fast.content[0].text == "fast ok"
+            assert connection.connected is True
+        finally:
+            await connection.close()
+
+
+async def test_the_headers_client_outlasts_the_calls_own_budget():
+    """The socket read must not fire before the dispatcher's per-request timeout.
+
+    Both are fatal in different ways: losing the race means a dead session, so the
+    margin is the fix, not a tidiness setting.
+    """
+    connection = MCPConnection(headers_spec("http://127.0.0.1:1/mcp", timeout=120.0))
+    client = connection._build_http_client({"x-api-key": "test"})
+    if client is None:
+        pytest.skip("httpx2 is not installed")
+    try:
+        assert client.timeout.read == pytest.approx(120.0 + 30.0)
+        # ...and a mistyped URL still reports quickly rather than after 150 s.
+        assert client.timeout.connect < 30.0
+    finally:
+        await client.aclose()
+
+
+async def test_a_server_that_really_died_is_reported_not_still_shown_as_connected():
+    """A session that is really gone must stop reading as "connected".
+
+    "Connected", next to a call that fails instantly, is the least actionable answer
+    the panel can give.
+    """
+    async with live_mcp_server() as stub:
+        connection = MCPConnection(headers_spec(stub.url, timeout=5.0))
+        await connection.connect()
+        try:
+            assert connection.connected is True
+            await stub.stop()
+            with pytest.raises(MCPToolError):
+                await connection.call("fast", {})
+            assert connection.connected is False
+            assert connection.status()["connected"] is False
+            assert "Reload" in connection.error
+            assert any("connection lost" in entry["text"] for entry in connection.log)
+        finally:
+            await connection.close()
 

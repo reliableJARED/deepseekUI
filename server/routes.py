@@ -37,7 +37,14 @@ from deepseek_client.messages import ensure_tool_pairing
 from .llm import compose_system, sse
 from .mcp import DEFAULT_CALL_TIMEOUT, MCPDocument, MCPServerSpec, probe_server, read_mcp_document
 from .media import classify_kind, is_text_mime, sniff_mime, text_facts
-from .settings import api_key_status, load_environ, set_api_key
+from .settings import (
+    MAX_TOOL_STEPS_LIMIT,
+    MIN_TOOL_STEPS,
+    api_key_status,
+    load_environ,
+    set_api_key,
+    set_tool_steps,
+)
 
 logger = logging.getLogger("deepseek_ui.routes")
 
@@ -204,20 +211,31 @@ def create_routes(state) -> list[Route]:
 
     # ── props ──
 
+    def _limits() -> dict:
+        """Limits the UI displays, plus the bounds of the one the panel can change.
+
+        ``max_tool_steps`` is read through ``settings.effective`` rather than the
+        attribute so a value changed at runtime is reported back, instead of the one
+        the process booted with.
+        """
+        return {
+            "model_image_max_dim": settings.model_image_max_dim,
+            "model_video_max_dim": settings.model_video_max_dim,
+            "model_video_fps": settings.model_video_fps,
+            "model_video_max_frames": settings.model_video_max_frames,
+            "model_max_images": settings.model_max_images,
+            "context_safety_ratio": settings.context_safety_ratio,
+            "max_tool_steps": settings.effective("max_tool_steps"),
+            "min_tool_steps": MIN_TOOL_STEPS,
+            "max_tool_steps_limit": MAX_TOOL_STEPS_LIMIT,
+        }
+
     def _static_props() -> dict:
         """The parts of the props payload that never depend on the model being up."""
         return {
             "version": state.version,
             "reasoning_efforts": list(state.reasoning_efforts),
-            "limits": {
-                "model_image_max_dim": settings.model_image_max_dim,
-                "model_video_max_dim": settings.model_video_max_dim,
-                "model_video_fps": settings.model_video_fps,
-                "model_video_max_frames": settings.model_video_max_frames,
-                "model_max_images": settings.model_max_images,
-                "max_tool_steps": settings.max_tool_steps,
-                "context_safety_ratio": settings.context_safety_ratio,
-            },
+            "limits": _limits(),
             # Both MCP helpers are defined further down in this same closure. They are
             # bound long before the first request is served, and sharing them keeps
             # /api/props and /api/mcp from drifting into two different shapes.
@@ -333,6 +351,41 @@ def create_routes(state) -> list[Route]:
             "saved": str(path),
             "client_ready": ready,
             "error": error,
+        })
+
+    async def settings_limits(request: Request) -> Response:
+        """Read or change the tool-loop ceiling.
+
+        ``max_tool_steps`` is the one limit here that can be changed while the server
+        runs. Writing `.env` is not enough on its own, for the same reason it is not
+        enough for the API key: ``load_env_file`` never overrides an entry that is
+        already in the process environment, so the value the process booted with would
+        keep winning. :func:`set_tool_steps` writes the file, updates ``os.environ``
+        and records a live override on the shared ``Settings`` instance the engine and
+        the built-in tools already point at — so the next message uses the new ceiling
+        with nothing to restart and nothing to invalidate.
+        """
+        if request.method == "GET":
+            return ok({"limits": _limits()})
+
+        body = await read_json(request)
+        if "max_tool_steps" not in body:
+            return fail("max_tool_steps is required")
+
+        try:
+            steps = set_tool_steps(settings, body["max_tool_steps"])
+        except ValueError as exc:
+            # A rejected save must leave the working value alone, so nothing is
+            # written before validation succeeds.
+            return fail(str(exc))
+        except OSError as exc:
+            logger.error("could not write %s: %s", settings.env_file, exc)
+            return fail(f"could not write {settings.env_file}: {exc}", 500)
+
+        return ok({
+            "limits": _limits(),
+            "max_tool_steps": steps,
+            "saved": str(settings.env_file),
         })
 
     async def health(_: Request) -> Response:
@@ -1075,6 +1128,7 @@ def create_routes(state) -> list[Route]:
         Route("/api/health", health),
         Route("/api/props", props),
         Route("/api/settings/api-key", settings_api_key, methods=["GET", "POST"]),
+        Route("/api/settings/limits", settings_limits, methods=["GET", "POST"]),
 
         Route("/api/conversations", list_conversations, methods=["GET"]),
         Route("/api/conversations", create_conversation, methods=["POST"]),

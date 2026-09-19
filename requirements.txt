@@ -13,6 +13,13 @@ opencv-python>=4.10        # video frame extraction and frame-count reduction
 # ── MCP client (optional) ─────────────────────────────────────────────────────
 mcp>=2.2                   # official Python SDK; streamable HTTP transport
 
+# ── Web search (MCP server, mcp_server/mcpserver.py) ──────────────────────────
+# Only needed by the tool server, not by the app. web_search is one grounded
+# gemini-2.5-flash call: Gemini runs the search and returns a summary plus the
+# source URLs. Free tier (500 grounded requests/day) needs only an API key from
+# https://aistudio.google.com/apikey — no billing account.
+google-genai>=1.0
+
 # ── Not required ──────────────────────────────────────────────────────────────
 # Shipped as part of the standard library / already vendored:
 #   python-dotenv  -> replaced by deepseek_client.config.load_env_file

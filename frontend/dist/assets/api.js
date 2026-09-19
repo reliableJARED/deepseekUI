@@ -101,6 +101,13 @@ export const api = {
   setApiKey: (apiKey) =>
     jsonRequest('/api/settings/api-key', { method: 'POST', body: { api_key: apiKey } }),
 
+  /** The limits the tool loop runs under, including `max_tool_steps`. */
+  limits: () => jsonRequest('/api/settings/limits'),
+
+  /** Change a limit (currently just `max_tool_steps`). Live for the next message. */
+  setLimits: (limits) =>
+    jsonRequest('/api/settings/limits', { method: 'POST', body: limits }),
+
   listConversations: () => jsonRequest('/api/conversations'),
   createConversation: (body = {}) => jsonRequest('/api/conversations', { method: 'POST', body }),
   getConversation: (uuid) => jsonRequest(`/api/conversations/${encodeURIComponent(uuid)}`),

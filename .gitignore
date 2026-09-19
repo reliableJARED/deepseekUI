@@ -2,6 +2,9 @@
 .env
 *.env
 !.env.example
+# MCP servers, same reason: the `manual.headers` block holds API keys in plain text.
+# Committed as `mcp.example.json`; whichever starts first copies it to `mcp.json`.
+mcp.json
 
 # Local media / conversation store
 memory/
