@@ -6,6 +6,7 @@ import subprocess
 import html as html_lib
 import urllib.parse
 import urllib.request
+from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor
 
 from starlette.applications import Starlette
@@ -22,16 +23,27 @@ SERVER_PORT      = 8572
 HTTP_UA          = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
 # ── web_search: one Gemini call, grounded in Google Search ────────────────────
-# The model is named here rather than left to the caller because gemini-3.6-flash
+# The model is named here rather than left to the caller because Gemini 3.1 Flash-Lite
 # is the one whose Google-Search grounding is free (500 requests/day); a model
 # outside that tier would quietly bill the key's project instead.
 #
 # The API key arrives per request from the MCP client, which stores it on this
 # server's entry in mcp.json — see _api_key(). GEMINI_API_KEY / GOOGLE_API_KEY in
 # the environment is the fallback, for running this file by hand.
-GEMINI_MODEL       = os.environ.get("GEMINI_SEARCH_MODEL", "").strip() or "gemini-3.6-flash"
+GEMINI_MODEL       = os.environ.get("GEMINI_SEARCH_MODEL", "").strip() or "gemini-3.1-flash-lite"
 GEMINI_TIMEOUT     = 90      # seconds for the whole grounded call
 SEARCH_MAX_SOURCES = 8       # source URLs echoed back with the answer
+
+# Grounding sources do not arrive as publisher URLs. Each one is wrapped in an
+# opaque Google hop — vertexaisearch.cloud.google.com/grounding-api-redirect/
+# AUZIYQ... — which names no publisher and carries a signature that expires. The
+# caller only ever reports what this server hands it, so the hop is taken here,
+# once per source, and the address a browser would land on is what goes back.
+# See _resolve_redirect().
+SEARCH_RESOLVE_REDIRECTS = True  # False = pass the grounding URLs through untouched
+REDIRECT_TIMEOUT   = 15      # seconds per source hop
+REDIRECT_WORKERS   = 8       # sources followed in parallel
+REDIRECT_SCAN_BYTES = 8192   # body prefix read when a 200 hides the redirect
 
 # Request headers accepted as the API key, most specific first. Recognising
 # several spellings means the generic "Headers" box in the settings panel — not
@@ -42,8 +54,8 @@ API_KEY_ENV     = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 # web_fetch tuning.
 #
 # There is deliberately NO model in this path. Fetching a page is a download and a
-# tag strip, so it finishes in the time the network takes and can never outlive the
-# MCP client's per-call budget.
+# mechanical prune of the page furniture, so it finishes in the time the network
+# takes and can never outlive the MCP client's per-call budget.
 #
 # It used to hand the page to local llama.cpp — a 4-way parallel map over chunks,
 # then a reduce — to strip boilerplate, which took ~135 s on a large page. The MCP
@@ -52,8 +64,15 @@ API_KEY_ENV     = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 # connection and the transport reads it as end-of-stream), so every fetch after the
 # first big page failed with "Connection closed" — including a bare example.com.
 # The caller is a large-context model: give it the page and let it do the reading.
+#
+# The page is PRUNED of page furniture before it goes out (see the HTML section
+# below), which is a token saving rather than a summary: the pass is mechanical,
+# it is fast enough to stay inside the budget by construction, and what it removed
+# is disclosed in the reply. It also moves the cap: a chrome-heavy page spends its
+# 60k characters on nav and cookie notices and gets truncated before the article
+# starts, which is the real cost of leaving the furniture in.
 FETCH_TIMEOUT      = 30      # socket timeout for the initial page download
-FETCH_BODY_CAP     = 60_000  # max chars of cleaned page text returned
+FETCH_BODY_CAP     = 60_000  # max chars of pruned page text returned
 OUTPUT_CHAR_CAP    = 80_000  # cap on a web_search summary (a page is capped at FETCH_BODY_CAP)
 
 # media extraction tuning.
@@ -79,7 +98,8 @@ TOOLS = [
         "description": (
             "Search the internet for any topic. Returns a written summary followed by "
             "the source URLs it was grounded on — cite them, and open one with "
-            "web_fetch when the summary is not enough. "
+            "web_fetch when the summary is not enough. Each source is the publisher's "
+            "own URL, already resolved, so it can be quoted or opened as it stands. "
             "Use it for current events, news, API updates, new developments, or anything "
             "outside your training data. "
             "Pass a specific, descriptive natural-language query with names, dates, and key words. "
@@ -101,11 +121,13 @@ TOOLS = [
             "Open a URL directly and return the page as readable plain text. "
             "Use this whenever the user gives you a URL, or on any address you already "
             "know — no search required. Accepts a bare domain like example.com. "
-            "Content images on the page are returned alongside the text, so you can "
-            "see them. "
-            "You get the whole page, with its HTML tags removed — so it can still "
-            "carry navigation, cookie notices and other page furniture. Read past "
-            "what you don't need and summarise it yourself; there is no "
+            "Navigation, cookie notices, footers and similar page furniture are "
+            "removed before the text comes back, so it is the page's main content "
+            "rather than a copy of everything on the screen — the result says so, "
+            "and something the user can see may have been pruned away. "
+            "Images from that content come back alongside the text, so you can see "
+            "them. "
+            "Read and summarise the returned text yourself; there is no "
             "pre-summarising step."
         ),
         "inputSchema": {
@@ -133,6 +155,245 @@ def _truncate(text: str, char_cap: int) -> str:
     if " " in cut:
         cut = cut.rsplit(" ", 1)[0]
     return cut + " …"
+
+
+# ─────────────────────────────────────────────
+# HTML → text: build a tree, prune the furniture, render what is left
+# ─────────────────────────────────────────────
+# A regex cannot do this job. `<script>.*?</script>` is not nesting-safe, so an
+# `<svg>` holding a nested `<svg>` — which is what an icon sprite is — ends the
+# match at the INNER close tag and leaks the rest of the sprite out as text. And
+# the question that decides the most here, "is this `<header>` the site's masthead
+# or the article's own title?", needs ancestors, which a regex does not have. Both
+# come free from a tree, and html.parser is in the standard library and tolerant of
+# the malformed markup real pages ship.
+#
+# The rules are ordered below by how much each one can lose:
+#   1. tags whose contents a browser does not show either     — cannot lose anything
+#   2. `nav`, plus header/footer/aside outside the article     — the spec's own names
+#   3. id/class/role words (cookie, newsletter, share, …)      — learned hints
+#   4. link density                                            — a link list, not prose
+# Only rule 1 is safe by construction, so the reply says what was removed
+# (PRUNE_NOTE) instead of hiding it: the model can then tell the user the page may
+# hold more, rather than reporting the gap as a fact about the page.
+
+# Never page text: a browser does not render these either, so dropping them cannot
+# lose anything a reader can see.
+PRUNE_DROP_TAGS = frozenset((
+    "script", "style", "noscript", "template", "iframe", "svg", "canvas",
+    "form", "button", "select", "option", "optgroup", "textarea", "label",
+    "fieldset", "legend", "object", "embed", "applet", "audio", "video",
+    "dialog", "marquee",
+))
+
+# `nav` is furniture wherever it appears. header/footer/aside are furniture only
+# OUTSIDE the article: HTML5 puts an article's title, byline and date in its own
+# <header> and its pull quotes in <aside>, so dropping those by tag would delete
+# the very lines a summary most needs.
+PRUNE_ALWAYS_TAGS = frozenset(("nav",))
+PRUNE_MAIN_TAGS   = frozenset(("main", "article"))
+PRUNE_UNLESS_MAIN = frozenset(("header", "footer", "aside"))
+
+# Hints matched against WHOLE words split out of id/class/role/aria-label, so
+# `cookie-banner` matches `cookie` while `shareholder-report` does not match
+# `share`. The first group is furniture anywhere; the second counts only outside
+# the article, because a page can legitimately be *about* something named `nav`.
+PRUNE_ALWAYS_HINTS = frozenset((
+    "cookie", "cookies", "consent", "gdpr", "newsletter", "subscribe",
+    "subscription", "signup", "modal", "popup", "overlay", "breadcrumb",
+    "breadcrumbs", "pagination", "pager", "share", "sharing", "social",
+    "skip", "advert", "advertisement", "ads", "adsbygoogle", "sponsor",
+    "sponsored", "promo", "promotional", "outbrain", "taboola",
+))
+PRUNE_UNLESS_MAIN_HINTS = frozenset((
+    "nav", "navbar", "navigation", "menu", "menubar", "sidebar", "masthead",
+    "toolbar", "topbar", "header", "footer", "banner", "drawer", "hamburger",
+))
+
+# Link density. A block that is mostly links is a link list — a menu, a footer, a
+# related-posts strip — not prose. Two exemptions keep the useful case: a block
+# carrying a HEADING is not a link list, and neither is the level below it. A table
+# of contents is
+#   <section><h2>On this page</h2><ul><li><a>…</a></li></ul></section>
+# where the links live in the <ul>, not in the block that carries the heading — and
+# on a documentation page it is often the most useful thing there is.
+PRUNE_LINK_DENSITY   = 0.5
+PRUNE_LINK_MIN_CHARS = 200
+PRUNE_HEADING_TAGS   = frozenset(("h1", "h2", "h3", "h4", "h5", "h6"))
+
+# Rendered with a line break before and after, so blocks do not fuse into one
+# paragraph. Everything else is inline and contributes only its text.
+PRUNE_BLOCK_TAGS = frozenset((
+    "address", "article", "aside", "blockquote", "br", "dd", "details", "div",
+    "dl", "dt", "fieldset", "figcaption", "figure", "footer", "h1", "h2", "h3",
+    "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p", "pre",
+    "section", "summary", "table", "tbody", "td", "tfoot", "th", "thead",
+    "title", "tr", "ul",
+))
+
+# Told to the model on every fetch. The tool cannot know what the heuristic
+# removed, but it can say that something was removed — which is what stops a pruned
+# section from being reported to the user as a section the page does not have.
+PRUNE_NOTE = (
+    "The contents of this web page have been passed through HTMLParser to attempt "
+    "to remove inconsequential content, if the user can see something on this page "
+    "you can't that is why"
+)
+
+_HTML_VOID_TAGS = frozenset((
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+    "param", "source", "track", "wbr",
+))
+
+
+class _DomNode:
+    """One element — or one run of text, which carries tag "" — in a parsed page."""
+
+    __slots__ = ("tag", "attrs", "children", "text")
+
+    def __init__(self, tag: str = "", attrs: dict | None = None, text: str = ""):
+        self.tag = tag
+        self.attrs = attrs or {}
+        self.children: list[_DomNode] = []
+        self.text = text
+
+
+class _DomBuilder(HTMLParser):
+    """HTML → tree. Character references are decoded by the parser itself."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.root = _DomNode("[document]")
+        self._stack = [self.root]
+
+    def handle_starttag(self, tag, attrs):
+        node = _DomNode(tag, {name.lower(): (value or "") for name, value in attrs})
+        self._stack[-1].children.append(node)
+        if tag not in _HTML_VOID_TAGS:
+            self._stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        self._stack[-1].children.append(
+            _DomNode(tag, {name.lower(): (value or "") for name, value in attrs}))
+
+    def handle_endtag(self, tag):
+        # Unbalanced markup is the norm: close the nearest matching open tag and
+        # ignore a close tag with no opener, rather than unwinding the stack — one
+        # stray `</div>`, which every page has, would otherwise flatten the rest of
+        # the document into it.
+        for depth in range(len(self._stack) - 1, 0, -1):
+            if self._stack[depth].tag == tag:
+                del self._stack[depth:]
+                return
+
+    def handle_data(self, data):
+        self._stack[-1].children.append(_DomNode(text=data))
+
+
+def _node_text(node: _DomNode) -> str:
+    if not node.tag:
+        return node.text
+    return "".join(_node_text(child) for child in node.children)
+
+
+def _link_text(node: _DomNode) -> str:
+    if node.tag == "a":
+        return _node_text(node)
+    if not node.tag:
+        return ""
+    return "".join(_link_text(child) for child in node.children)
+
+
+def _has_heading(node: _DomNode) -> bool:
+    if node.tag in PRUNE_HEADING_TAGS:
+        return True
+    return any(_has_heading(child) for child in node.children)
+
+
+def _attr_words(node: _DomNode) -> set[str]:
+    """The whole words of a node's id/class/role/aria-label, lower-cased."""
+    raw = " ".join(node.attrs.get(name, "")
+                   for name in ("id", "class", "role", "aria-label")).lower()
+    return {word for word in re.split(r"[^a-z0-9]+", raw) if word}
+
+
+def _is_link_farm(node: _DomNode) -> bool:
+    """True for a block that is mostly links — a menu or a related-posts strip.
+
+    Measured on whitespace-normalised text: the indentation between `<li>` tags is
+    real characters in the tree and would otherwise dilute the ratio until nothing
+    ever looked like a link list.
+    """
+    text = re.sub(r"\s+", " ", _node_text(node)).strip()
+    if len(text) < PRUNE_LINK_MIN_CHARS or _has_heading(node):
+        return False
+    linked = len(re.sub(r"\s+", " ", _link_text(node)).strip())
+    return linked / len(text) > PRUNE_LINK_DENSITY
+
+
+def _prune(node: _DomNode, in_main: bool = False) -> None:
+    """Drop furniture from the tree in place. `in_main` tracks the article's ancestry."""
+    # Children of a block that has a heading of its own are exempt from the link
+    # density rule — see PRUNE_LINK_DENSITY. This has to be decided BEFORE the
+    # children are walked, because the rule is applied to them on the way back up.
+    titled = any(child.tag in PRUNE_HEADING_TAGS for child in node.children)
+    kept: list[_DomNode] = []
+    for child in node.children:
+        if not child.tag:                      # a text run, never furniture
+            kept.append(child)
+            continue
+        if child.tag in PRUNE_DROP_TAGS or child.tag in PRUNE_ALWAYS_TAGS:
+            continue
+        main = in_main or child.tag in PRUNE_MAIN_TAGS
+        if not main and child.tag in PRUNE_UNLESS_MAIN:
+            continue
+        words = _attr_words(child)
+        if words & PRUNE_ALWAYS_HINTS or (not main and words & PRUNE_UNLESS_MAIN_HINTS):
+            continue
+        _prune(child, main)
+        # Only a BLOCK can be a link list. Without that guard the rule reaches the
+        # page's own structure: on a page that is mostly links — an index, an
+        # archive, a link directory — `<html>` itself looks like a link farm and
+        # the entire document is dropped, which is not a prune.
+        if not titled and child.tag in PRUNE_BLOCK_TAGS and _is_link_farm(child):
+            continue
+        kept.append(child)
+    node.children = kept
+
+
+def _build_tree(body: str) -> _DomNode:
+    builder = _DomBuilder()
+    builder.feed(body)
+    builder.close()
+    return builder.root
+
+
+def _parse_and_prune(body: str) -> _DomNode:
+    root = _build_tree(body)
+    _prune(root)
+    return root
+
+
+def _render_text(root: _DomNode) -> str:
+    """The tree's visible text, with block tags rendered as line breaks."""
+    chunks: list[str] = []
+
+    def walk(node: _DomNode) -> None:
+        if not node.tag:
+            chunks.append(node.text)
+            return
+        block = node.tag in PRUNE_BLOCK_TAGS
+        if block:
+            chunks.append("\n")
+        for child in node.children:
+            walk(child)
+        if block:
+            chunks.append("\n")
+
+    walk(root)
+    text = "".join(chunks).replace("\xa0", " ").replace("\u200b", "")
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    return re.sub(r"\n\s*\n+", "\n\n", text).strip()
 
 
 # ─────────────────────────────────────────────
@@ -205,6 +466,129 @@ def _grounding_sources(response) -> list[tuple[str, str]]:
     return sources
 
 
+# ── grounding redirects ───────────────────────────────────────────────────────
+# A grounding chunk's URI is not the page. It is a redirect on Google's own host:
+#
+#   dreampixelforge.com — https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQ...
+#
+# That URL is useless to the caller in three separate ways. It names Google, not
+# the publisher, so a citation built from it attributes the claim to the wrong
+# site. It is opaque, so nothing downstream — the user, a log, the model's own
+# follow-up fetch — can tell where it goes without opening it. And it is signed and
+# time-limited, so it rots: a link that worked when the answer was written is dead
+# by the time anyone clicks it.
+#
+# The redirects themselves do work, so the fix is to take the hop rather than to ask
+# Gemini for something it does not have. One request per source, in parallel, and
+# the publisher URL replaces the redirect before the summary is written.
+GROUNDING_REDIRECT_HOST = "vertexaisearch.cloud.google.com"
+
+
+def _is_grounding_redirect(url: str) -> bool:
+    """True for the opaque hops that need following.
+
+    Deliberately narrow: a source that is already a real URL is left exactly as
+    Gemini reported it, so a citation the model could have used as-is is never
+    rewritten — and never costs a request.
+    """
+    if "grounding-api-redirect" in url.lower():
+        return True
+    return (urllib.parse.urlsplit(url).hostname or "").lower() == GROUNDING_REDIRECT_HOST
+
+
+def _redirect_page_target(body: str, base_url: str) -> str:
+    """The destination of a page that redirects from inside its own HTML.
+
+    Not every hop answers with a 3xx. Some serve a small document carrying
+    ``<meta http-equiv="refresh" content="0;url=...">`` or a ``location.href =
+    "..."`` instead, and urllib has no reason to follow either — the status was 200,
+    so as far as it is concerned the request is over. Checking both spellings is
+    what makes those sources resolve like the rest.
+    """
+    match = (re.search(r"""<meta[^>]+http-equiv\s*=\s*["']?refresh["']?[^>]*?"""
+                       r"""content\s*=\s*["'][^"']*?url\s*=\s*([^"'>\s]+)""", body, re.I)
+             # `location.href = "..."`, `location = "..."`, `location.replace("...")`
+             # and `location.assign("...")` — one alternation, so group(1) is
+             # always the URL whatever the page used.
+             or re.search(r"""(?:location(?:\.href)?\s*=\s*|"""
+                          r"""location\.(?:replace|assign)\(\s*)["']([^"']+)["']""",
+                          body, re.I))
+    if not match:
+        return ""
+    target = html_lib.unescape(match.group(1)).strip()
+    # A relative target is normal here, so resolve it against the hop itself.
+    return urllib.parse.urljoin(base_url, target) if target else ""
+
+
+def _resolve_redirect(url: str) -> str:
+    """Follow one grounding redirect and return the publisher URL it lands on.
+
+    The body is not read: ``urlopen`` completes the whole redirect chain before it
+    returns, so ``geturl()`` already holds the final address and the connection can
+    be closed straight away. That keeps a source to a round-trip of headers rather
+    than a full page download — which matters, because this runs on every search
+    and the search has to stay inside the MCP client's per-call budget.
+
+    A 200 that still points at the hop itself is the one case that needs the body —
+    see _redirect_page_target(); only a capped prefix of it is read.
+
+    Returns "" both when the URL is not a hop at all and when a hop cannot be taken,
+    so the caller keeps the original URL either way. A source that needs no request
+    must never cost one: that is what _is_grounding_redirect() is for.
+    """
+    if not _is_grounding_redirect(url):
+        return ""
+
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": HTTP_UA})
+        with urllib.request.urlopen(request, timeout=REDIRECT_TIMEOUT) as response:
+            final = str(response.geturl() or "").strip()
+            if not final or final == url:
+                head = response.read(REDIRECT_SCAN_BYTES).decode("utf-8", "replace")
+                final = _redirect_page_target(head, url) or final
+        return final
+    except Exception as exc:
+        print(f"[search] source redirect not followed ({url[:80]}): "
+              f"{type(exc).__name__}: {exc}")
+        return ""
+
+
+def _resolve_sources(sources: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Replace every grounding redirect with the publisher's own URL.
+
+    Followed in parallel — one hop each, so the added wall clock is a single
+    round-trip for the batch rather than one per source — with Gemini's ordering
+    preserved. Two hops that land on the same page collapse into one entry: the same
+    article cited twice under two different signatures is one citation.
+
+    A source that is already a real URL, or whose hop cannot be taken, comes back
+    unchanged. A working redirect is a worse citation than a publisher URL, but a
+    far better one than nothing.
+    """
+    sources = sources[:SEARCH_MAX_SOURCES]
+    if not SEARCH_RESOLVE_REDIRECTS or not sources:
+        return sources
+
+    with ThreadPoolExecutor(max_workers=REDIRECT_WORKERS) as pool:
+        landed = list(pool.map(lambda item: _resolve_redirect(item[1]), sources))
+
+    resolved: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for (title, original), final in zip(sources, landed):
+        url = final or original
+        key = url.rstrip("/").lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved.append((title, url))
+
+    taken = sum(1 for final in landed if final)
+    if taken:
+        print(f"[search] followed {taken}/{len(sources)} grounding redirects "
+              f"to publisher URLs")
+    return resolved
+
+
 def _key_hint(exc: Exception) -> str:
     """A plain-English reason for a Gemini error, or "" when it is not clear-cut."""
     low = str(exc).lower()
@@ -222,6 +606,10 @@ def _gemini_search(query: str, api_key: str) -> str:
     model attribute a claim, and they are the input to web_fetch when the summary
     is not enough. Grounding metadata is the only reason to prefer this over any
     other search API — it is what makes the answer checkable.
+
+    What goes back is the publishers' own URLs. Gemini reports each source as an
+    opaque Google redirect, and those are followed here so the caller never has to
+    know a hop was involved — see _resolve_sources().
     """
     try:
         from google import genai
@@ -296,42 +684,89 @@ def _gemini_search(query: str, api_key: str) -> str:
             "probably refused before it ran."
         )
 
+    # Last step before the summary is written, so nothing downstream — the model,
+    # the transcript, the user's click — ever sees a redirect. This is also where
+    # the source cap is applied, so the hops taken are only the ones reported.
+    sources = _resolve_sources(sources)
+
     lines = [answer or "(Gemini searched but returned no written answer.)"]
     if sources:
         lines += ["", "Sources:"]
-        for index, (title, url) in enumerate(sources[:SEARCH_MAX_SOURCES], 1):
+        for index, (title, url) in enumerate(sources, 1):
             lines.append(f"{index}. {title} — {url}" if title else f"{index}. {url}")
     return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────
-# URL fetch + tag strip
+# URL fetch — a page in, pruned text and content images out
 # ─────────────────────────────────────────────
-def _readable_text(body: str) -> str:
-    """Visible text of an HTML document, with the markup removed.
+def _fallback_text(body: str) -> str:
+    """The old mechanical strip, kept as a last resort.
 
-    Non-content elements (script, style, iframe, form, svg) are dropped whole so
-    their contents never appear as text, block-level tags become line breaks so
-    paragraphs do not fuse into one another, and every remaining tag is stripped.
-
-    This is the entirety of web_fetch's cleanup. It is mechanical on purpose: an
-    LLM pass here cost ~135 s on a large page and blew the MCP client's 120 s
-    per-call budget, which is what made every fetch fail after the first big page.
+    Used only when the tree pass renders NOTHING, which means the heuristic met a
+    page it does not understand rather than an empty page. Keeping the furniture is
+    better than a false "no readable text found" for a page a browser renders in
+    full, and the note still says that a pass ran.
     """
     body = re.sub(r"<(script|style|noscript|iframe|svg|form)[^>]*>.*?</\1>",
                   " ", body, flags=re.S | re.I)
     body = re.sub(r"<(p|div|br|li|tr|h[1-6]|section|article)[^>]*>",
                   "\n", body, flags=re.I)
-    text = _strip_html(body)
-    text = re.sub(r"[ \t]+", " ", text)
-    return re.sub(r"\n\s*\n+", "\n\n", text).strip()
+    return _strip_html(body)
+
+
+def _with_note(text: str) -> str:
+    """Cap the text and say that a prune pass ran over it — see PRUNE_NOTE."""
+    return _truncate(text, FETCH_BODY_CAP) + "\n\n" + PRUNE_NOTE
+
+
+def _render_page(body: str, base_url: str) -> tuple[str, list[str]]:
+    """A page's HTML → (its pruned text, its content-image URLs).
+
+    Pure — no network — so the whole pass can be pinned on a saved page in tests.
+    The pruning is disclosed in the returned text (PRUNE_NOTE) because it is a
+    heuristic: text the model never sees must not come back missing without a word,
+    or the absence gets reported to the user as a fact about the page.
+    """
+    try:
+        root = _parse_and_prune(body)
+    except Exception as exc:
+        # html.parser is tolerant, but it is not obliged to be. On a construct it
+        # rejects, strip tags mechanically rather than failing the fetch — no tree,
+        # so no images, but the text still arrives and the note still stands.
+        print(f"[fetch] HTML parse failed ({type(exc).__name__}: {exc}) — "
+              f"falling back to a plain tag strip")
+        text = _fallback_text(body)
+        return (_with_note(text), []) if text else ("", [])
+
+    text = _render_text(root)
+    if not text:
+        # Nothing survived the prune. That means the page IS its furniture — a link
+        # index, an archive, a 404 page — not that the page was empty, so hand it
+        # over whole (the note still says a pass ran) with its images taken from the
+        # UNPRUNED tree, because that is the page the model is being given. Parsing
+        # twice is the price of not keeping two trees alive on the normal path.
+        text = _fallback_text(body)
+        if not text:
+            return "", []
+        return _with_note(text), _images_from_tree(_build_tree(body), base_url)
+
+    return _with_note(text), _images_from_tree(root, base_url)
+
+
+def _readable_text(body: str) -> str:
+    """Visible text of an HTML document, with the page furniture pruned out.
+
+    Exactly what a fetch of this page would hand the model — same pass, same note.
+    """
+    return _render_page(body, "")[0]
 
 
 def _fetch_page(url: str) -> tuple[str, list[str]]:
-    """Download a URL → (cleaned visible text, content-image URLs).
+    """Download a URL → (pruned visible text, content-image URLs).
 
-    Image URLs are harvested from the raw HTML BEFORE tag stripping, with
-    logos/icons/ads/tracking pixels filtered out."""
+    Images come out of the PRUNED tree, so a logo that lived in the site header is
+    gone without needing a logo heuristic."""
     print("="*20)
     print(f"[_fetch_page]: debug url: {url[:120]}")
     req = urllib.request.Request(url, headers={"User-Agent": HTTP_UA})
@@ -340,46 +775,85 @@ def _fetch_page(url: str) -> tuple[str, list[str]]:
         body = resp.read().decode("utf-8", "replace")
 
     if "html" in ctype or body.lstrip().lower().startswith(("<", "<!doctype")):
-        img_urls = _extract_img_urls(body, url)
-        text = _readable_text(body)
-    else:
-        img_urls = []
-        text = body  # plain text / json / etc.
+        return _render_page(body, url)
 
-    return _truncate(text, FETCH_BODY_CAP), img_urls
+    # plain text / json / etc. — no tags to prune, so no note either
+    return _truncate(body, FETCH_BODY_CAP), []
 
 
 # ─────────────────────────────────────────────
 # Media extraction — content images as MCP image blocks
 # ─────────────────────────────────────────────
-def _extract_img_urls(body: str, base_url: str) -> list[str]:
-    """Pull main-content image URLs out of raw HTML.
+# Lazy-loading spellings first: a page that lazy-loads puts a placeholder in `src`
+# and the real image in `data-src`, so reading `src` first fetches a 1x1 gif.
+_IMG_SRC_ATTRS = ("data-src", "data-lazy-src", "data-original",
+                  "data-srcset", "srcset", "src")
 
-    Skips anything that smells like chrome/boilerplate: logos, icons, sprites,
-    avatars, ad/tracker hosts, SVGs, data URIs, and tiny declared dimensions
-    (1x1 pixels, spacer gifs, thumbnails)."""
+
+def _img_src(node: _DomNode) -> str:
+    for name in _IMG_SRC_ATTRS:
+        raw = (node.attrs.get(name) or "").strip()
+        if not raw:
+            continue
+        if name.endswith("srcset"):
+            # "a.jpg 1x, b.jpg 2x" — the first candidate is the one a browser would
+            # use at the smallest size, i.e. the real image.
+            raw = raw.split(",")[0].strip().split(" ")[0]
+        if raw:
+            return html_lib.unescape(raw)
+    return ""
+
+
+def _declared_too_small(node: _DomNode) -> bool:
+    """True only for a purely numeric width/height below MIN_IMG_DIM.
+
+    `width="100%"` is handled by the bytes filter instead of being read as 100 and
+    thrown away — a responsive image is not an icon.
+    """
+    dims = [int(value) for name in ("width", "height")
+            if (value := node.attrs.get(name, "")).isdigit()]
+    return bool(dims) and min(dims) < MIN_IMG_DIM
+
+
+def _images_from_tree(root: _DomNode, base_url: str) -> list[str]:
+    """Content-image URLs out of the PRUNED tree, article images ranked first.
+
+    Walking what survived the prune is what removes a logo or a social icon without
+    a logo heuristic: the header it lived in is already gone. Ranking is the other
+    half of it — the cap is small (FETCH_MAX_IMAGES), and document order alone
+    tends to spend it on a hero image and three icons before reaching the diagrams
+    in the body, so images inside article/main/figure/picture come first.
+    """
+    ranked: list[tuple[int, int, str]] = []
+    order = 0
+
+    def walk(node: _DomNode, priority: int) -> None:
+        nonlocal order
+        if node.tag:
+            if node.tag in PRUNE_MAIN_TAGS or node.tag in ("figure", "picture"):
+                priority = 1
+            if node.tag == "img" and not _declared_too_small(node):
+                src = _img_src(node)
+                if src:
+                    ranked.append((priority, order, src))
+                    order += 1
+            for child in node.children:
+                walk(child, priority)
+
+    walk(root, 0)
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+
     urls: list[str] = []
-    for tag in re.findall(r"<img\b[^>]*>", body, re.I):
-        # data-src first (lazy-loaded content images), then plain src
-        m = (re.search(r'data-src\s*=\s*["\']([^"\']+)["\']', tag, re.I)
-             or re.search(r'\bsrc\s*=\s*["\']([^"\']+)["\']', tag, re.I))
-        if not m:
-            continue
-        src = html_lib.unescape(m.group(1)).strip()
+    for _priority, _order, src in ranked:
         low = src.lower()
-        if not src or src.startswith("data:") or low.split("?")[0].endswith(".svg"):
+        if src.startswith("data:") or low.split("?")[0].endswith(".svg"):
             continue
-        if any(h in low for h in IMG_BAD_HINTS):
+        if any(hint in low for hint in IMG_BAD_HINTS):
             continue
-        # declared width/height below MIN_IMG_DIM → icon / tracking pixel
-        dims = re.findall(r'\b(?:width|height)\s*=\s*["\']?(\d+)', tag, re.I)
-        dims = [int(d) for d in dims]
-        if dims and min(dims) < MIN_IMG_DIM:
-            continue
-        abs_url = urllib.parse.urljoin(base_url, src)
         # percent-encode non-ASCII (e.g. CJK filenames) — urllib's request
         # machinery requires an ASCII-safe URL string
-        abs_url = urllib.parse.quote(abs_url, safe=":/?#[]@!$&'()*+,;=%")
+        abs_url = urllib.parse.quote(urllib.parse.urljoin(base_url, src),
+                                     safe=":/?#[]@!$&'()*+,;=%")
         if abs_url not in urls:
             urls.append(abs_url)
         if len(urls) >= FETCH_MAX_IMAGES:
@@ -485,9 +959,9 @@ def call_tool(name: str, arguments: dict, api_key: str = "") -> list:
         if not text:
             return [{"type": "text", "text": f"No readable text found at: {url}"}]
 
-        # The page goes back as-is (already tag-stripped and capped by _fetch_page).
-        # The caller is an LLM with a large context window, so reading and
-        # summarising is its job — this tool only fetches.
+        # The page goes back as-is (already pruned, noted and capped by
+        # _fetch_page). The caller is an LLM with a large context window, so reading
+        # and summarising is its job — this tool only fetches.
         blocks = [{"type": "text", "text": text}]
         # attach content images as MCP image blocks so the calling LLM gets the
         # page's media alongside its text.
@@ -557,14 +1031,18 @@ async def handle_jsonrpc(request: Request) -> Response:
                     "instructions": (
                         "Two tools. web_search(query) searches the web and returns a "
                         "written summary followed by the source URLs it was grounded "
-                        "on — quote them, and open one with web_fetch when the "
+                        "on — the publishers' own addresses, already resolved, so quote "
+                        "them as they stand; open one with web_fetch when the "
                         "summary is not enough. web_fetch(url) opens a single page "
-                        "directly and returns the whole page as readable plain text "
-                        "plus its content images; use it whenever the user gives you "
+                        "directly and returns it as readable plain text plus its "
+                        "content images; use it whenever the user gives you "
                         "a URL or you already know the address, and it needs no "
-                        "search. Its text is the page with the HTML tags removed, so "
-                        "it can still include navigation and other page furniture — "
-                        "read past that, and do the summarising yourself. If "
+                        "search. Its text is the page with the HTML tags removed "
+                        "AND the page furniture pruned out — navigation, cookie "
+                        "notices, footers — and it ends by saying so. Treat it as "
+                        "the page's main content, not as a copy of everything on "
+                        "the screen, and do the summarising yourself; if something "
+                        "the user can see is missing, that is why. If "
                         "web_search reports "
                         "that it is unavailable, that is a missing key or an exhausted "
                         "quota rather than a lack of results: do not tell the user the "
@@ -665,5 +1143,6 @@ if __name__ == "__main__":
               "request (set it via\n                      the settings panel); "
               "GEMINI_API_KEY in this process's\n                      environment also "
               "works. web_fetch is unaffected.")
-    print("Fetch               : no key, no model — page text + content images")
+    print("Fetch               : no key, no model — page text pruned by HTMLParser "
+          "+ content images")
     uvicorn.run(app, host="127.0.0.1", port=SERVER_PORT)

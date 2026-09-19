@@ -29,6 +29,7 @@ from deepseek_client import DeepSeekClient, DeepSeekError
 from deepseek_client.messages import ensure_tool_pairing, estimate_tokens, sanitize_messages
 from deepseek_client.types import ToolCall
 
+from .media import display_note, split_display_blocks
 from .rehydrate import MediaBudget, rehydrate, strip_ui_blocks
 
 __all__ = ["ChatEngine", "TurnResult", "compose_system", "sse"]
@@ -283,6 +284,11 @@ class ChatEngine:
         loop = True
         step = 0
         last_messages: list[dict[str, Any]] = []
+        #: Media handed to the user during this turn. Collected across *every* step
+        #: because the reply the user is waiting for is usually not the step that
+        #: produced the media: ``web_fetch`` returns its images on step 1 and the
+        #: answer that mentions them arrives on step 2.
+        shown: list[dict[str, Any]] = []
 
         async def persist() -> None:
             """Write whatever the current step produced.
@@ -307,6 +313,21 @@ class ChatEngine:
             batch = ensure_tool_pairing(pending, context=f"turn={uuid}")
             await self.store.extend(uuid, batch)
             pending.clear()
+
+        async def flush_shown() -> None:
+            """Hang the media this turn displayed on its final assistant turn.
+
+            Once, at the end, rather than as each result arrives: the turn may have
+            several assistant messages (one per step) and exactly one of them is the
+            reply the user reads to, so anywhere else would put the picture under a
+            message that says nothing.
+            """
+            if not shown:
+                return
+            try:
+                await self._attach_shown(uuid, shown)
+            except Exception:                            # pragma: no cover - defensive
+                logger.exception("could not attach displayed media for %s", uuid)
 
         try:
             if pending:
@@ -389,14 +410,16 @@ class ChatEngine:
 
                     result.tool_calls += 1
                     outcome = await self._run_tool(registry, call)
-                    stored = self._store_tool_result(uuid, call, outcome)
+                    stored, shown_here = self._store_tool_result(uuid, call, outcome)
                     pending.append(stored)
+                    shown.extend(shown_here)
 
                     yield sse("tool_result", {
                         "id": call.id,
                         "name": call.name,
                         "is_error": outcome.is_error,
                         "blocks": _display_blocks(stored),
+                        "media": shown_here,
                         "step": step,
                     })
 
@@ -416,6 +439,7 @@ class ChatEngine:
                     })
 
             await persist()
+            await flush_shown()
 
             if result.usage:
                 yield sse("usage", result.usage)
@@ -440,6 +464,7 @@ class ChatEngine:
             # error is more useful than losing the turn.
             try:
                 await persist()
+                await flush_shown()
             except Exception:                            # pragma: no cover
                 logger.exception("could not persist a partial turn for %s", uuid)
             logger.warning("turn failed for %s: %s", uuid, exc)
@@ -455,6 +480,7 @@ class ChatEngine:
             # like here. Persist before letting it propagate.
             try:
                 await persist()
+                await flush_shown()
             except Exception:                            # pragma: no cover
                 logger.exception("could not persist an interrupted turn for %s", uuid)
             if not isinstance(exc, Exception):           # cancellation or shutdown
@@ -492,8 +518,15 @@ class ChatEngine:
             )
         return await registry.call(call.name, call.parsed_arguments)
 
-    def _store_tool_result(self, uuid: str, call: ToolCall, outcome) -> dict[str, Any]:
-        """Persist a tool result, keeping media on disk and text in the message."""
+    def _store_tool_result(self, uuid: str, call: ToolCall, outcome):
+        """Persist a tool result, keeping media on disk and text in the message.
+
+        Returns ``(stored message, media the user was shown)``. Media meant for the
+        user is *removed* from the message rather than left in it: the transcript is
+        replayed on every later request, and media left here is media the model would
+        be charged for seeing on every one of them. What replaces it is a line naming
+        the path, which is the part the model can act on.
+        """
         content = outcome.content
 
         if isinstance(content, list):
@@ -502,11 +535,42 @@ class ChatEngine:
             except Exception as exc:                     # pragma: no cover - defensive
                 logger.warning("could not persist tool media: %s", exc)
                 blocks = [{"type": "text", "text": f"[media could not be stored: {exc}]"}]
+            shown, blocks = split_display_blocks(blocks)
+            if shown:
+                blocks = [
+                    {"type": "text", "text": display_note(block)} for block in shown
+                ] + blocks
             payload = json.dumps(blocks, ensure_ascii=False)
         else:
             payload = str(content or "")
+            shown = []
 
-        return {"role": "tool", "tool_call_id": call.id, "name": call.name, "content": payload}
+        stored = {"role": "tool", "tool_call_id": call.id, "name": call.name, "content": payload}
+        return stored, shown
+
+    async def _attach_shown(self, uuid: str, shown: list[dict[str, Any]]) -> None:
+        """Record what the user was shown on the assistant turn they read.
+
+        Stored under a ``_``-prefixed key so it is invisible to the API: ``sanitize_messages``
+        and :func:`~server.rehydrate._rehydrate_assistant` both drop anything that
+        starts with an underscore, which makes this pure UI state rather than part of
+        the conversation the model replays.
+
+        The *last* assistant turn is the right home for it because the frontend renders
+        it above that turn's text — which is what "show me the picture, then answer"
+        means. When a turn ends on a tool step instead (the step limit was hit), the
+        last assistant turn is still the last thing the user sees, so it still works.
+        """
+
+        def _attach(conv) -> None:
+            for message in reversed(conv.messages):
+                if message.get("role") != "assistant":
+                    continue
+                existing = message.get("_display")
+                message["_display"] = list(existing or []) + shown
+                return
+
+        await self.store.mutate(uuid, _attach)
 
     async def _maybe_title(self, uuid: str, conv) -> str:
         """Name a conversation from its first user message."""

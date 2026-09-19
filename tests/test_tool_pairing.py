@@ -476,3 +476,223 @@ def test_tool_images_follow_the_whole_group(store, media, settings):
     assert roles(out) == ["user", "assistant", "tool", "tool", "user"]
     assert_paired(out)
     assert "Images returned by the tool above:" in json.dumps(out[-1]["content"])
+
+
+# ── media that is meant for the person ────────────────────────────────────────
+#
+# The second audience. A picture a tool produced *for the user* — a page image
+# `web_fetch` downloaded, a file `display_media` was handed — is cut out of the tool
+# result and hung on the assistant turn the user reads to, so the frontend can render
+# it above the answer. It must never reach the model: it is not the model's to look at
+# unless it asks (`inspect_media`), and leaving it in the transcript would charge it
+# for the image on every later request, forever.
+
+def frames_of(frames: list[str], event: str) -> list:
+    """The decoded payloads of every ``event`` frame in a turn's SSE output."""
+    out = []
+    for frame in frames:
+        lines = frame.splitlines()
+        if not lines or lines[0].strip() != f"event: {event}":
+            continue
+        for line in lines:
+            if line.startswith("data: "):
+                out.append(json.loads(line[len("data: "):]))
+    return out
+
+
+def last_assistant(messages) -> dict:
+    """The assistant turn the user reads to, which is where shown media is parked.
+
+    Not the last *message*: a turn that ends on tool calls has its results after it.
+    """
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            return message
+    raise AssertionError("no assistant turn in the transcript")
+
+
+def shot_registry(*, display: bool):
+    """A tool that returns one PNG, optionally marked as being for the user."""
+
+    async def shot(**kwargs):
+        block = {
+            "type": "image",
+            "data": base64.b64encode(make_png(16, 8)).decode(),
+            "mimeType": "image/png",
+        }
+        if display:
+            block["display"] = True
+            block["caption"] = "the monkey"
+        return [{"type": "text", "text": "took a picture"}, block]
+
+    registry = ToolRegistry()
+    registry.register(
+        shot, name="shot", description="takes a picture",
+        parameters={"type": "object", "properties": {}},
+    )
+    return registry
+
+
+async def test_media_for_the_user_is_cut_out_and_hung_on_the_reply(store, media, settings):
+    uuid = store.create(title="t").uuid
+    await store.append(uuid, user("show me the monkey"))
+
+    client = FakeClient(assistant_turn(("c1", "shot", "{}")), final_turn("here you go"))
+    engine = ChatEngine(settings, store, media, client, tool_registry=shot_registry(display=True))
+
+    frames = [frame async for frame in engine.stream_turn(uuid)]
+
+    written = store.load(uuid).messages
+    assert roles(written) == ["user", "assistant", "tool", "assistant"]
+
+    # Out of the tool result: what is left is the tool's own prose plus the path,
+    # which is the part the model can act on.
+    blocks = json.loads(written[2]["content"])
+    assert [b["type"] for b in blocks] == ["text", "text"]
+    assert "was shown to the user" in blocks[0]["text"]
+    assert blocks[1]["text"] == "took a picture"
+
+    # Onto the reply the user reads, which is the *last* assistant turn and usually
+    # not the step that produced the media.
+    shown = last_assistant(written)["_display"]
+    assert len(shown) == 1
+    assert shown[0]["type"] == "image"
+    assert shown[0]["display"] is True
+    assert shown[0]["caption"] == "the monkey"
+    assert shown[0]["url"].startswith(f"/memory/{uuid}/")
+    assert (store.root / uuid / shown[0]["url"].rsplit("/", 1)[-1]).is_file()
+
+    # The live paint is told in the same frame as the result, so the picture is not
+    # held back until the turn ends.
+    results = frames_of(frames, "tool_result")
+    assert len(results) == 1
+    assert results[0]["media"] == shown
+    assert results[0]["blocks"] == blocks
+
+
+async def test_media_for_the_user_is_never_sent_to_the_model(store, media, settings):
+    """The whole point of cutting it out: the API never sees the picture."""
+    uuid = store.create(title="t").uuid
+    await store.append(uuid, user("show me the monkey"))
+
+    client = FakeClient(
+        assistant_turn(("c1", "shot", "{}")),
+        final_turn("here you go"),
+        final_turn("anything else?"),
+    )
+    engine = ChatEngine(settings, store, media, client, tool_registry=shot_registry(display=True))
+
+    async for _frame in engine.stream_turn(uuid):
+        pass
+
+    assert roles(client.requests[1]) == ["user", "assistant", "tool"]
+    # The model is told where the picture is instead.
+    assert "was shown to the user" in json.dumps(client.requests[1])
+
+    # A later turn replays the whole transcript — the reply now carries `_display` on
+    # disk — and neither the marker nor the image can appear in it.
+    await store.append(uuid, user("what did you show me?"))
+    async for _frame in engine.stream_turn(uuid):
+        pass
+
+    replayed = client.requests[-1]
+    assert all("_display" not in message for message in replayed)
+    assert "data:image" not in json.dumps(replayed)
+    assert "was shown to the user" in json.dumps(replayed)
+
+
+async def test_media_the_model_asked_for_is_still_inlined(store, media, settings):
+    """An unmarked block is the model's to look at, and goes upstream untouched."""
+    uuid = store.create(title="t").uuid
+    await store.append(uuid, user("what is in this picture"))
+
+    client = FakeClient(assistant_turn(("c1", "shot", "{}")), final_turn("a blue square"))
+    engine = ChatEngine(settings, store, media, client, tool_registry=shot_registry(display=False))
+
+    async for _frame in engine.stream_turn(uuid):
+        pass
+
+    written = store.load(uuid).messages
+    assert [b["type"] for b in json.loads(written[2]["content"])] == ["text", "image"]
+    assert "_display" not in last_assistant(written)
+    # It travels in a `user` turn, which is the only place the API accepts an image.
+    assert roles(client.requests[1]) == ["user", "assistant", "tool", "user"]
+    assert "data:image" in json.dumps(client.requests[1])
+
+
+async def test_media_is_still_shown_when_the_step_limit_ends_the_turn(store, media):
+    """The turn's last assistant message is a tool call, and the user still sees it."""
+    settings = load_settings({}, load_dotenv=False, memory_root=store.root, max_tool_steps=1)
+    uuid = store.create(title="t").uuid
+    await store.append(uuid, user("show me the monkey"))
+
+    client = FakeClient(assistant_turn(("c1", "shot", "{}")))
+    engine = ChatEngine(settings, store, media, client, tool_registry=shot_registry(display=True))
+
+    frames = [frame async for frame in engine.stream_turn(uuid)]
+
+    written = store.load(uuid).messages
+    assert "tool_calls" in last_assistant(written)
+    assert len(last_assistant(written)["_display"]) == 1
+    assert frames_of(frames, "warning"), "the truncated turn says so"
+
+
+async def test_an_interrupted_turn_still_shows_what_it_had_already_shown(store, media, settings):
+    """A half-finished turn is the case where the media matters most."""
+    uuid = store.create(title="t").uuid
+    await store.append(uuid, user("show me two things"))
+
+    async def shot(**kwargs):
+        if kwargs.get("what") == "second":
+            raise asyncio.CancelledError()
+        return [{
+            "type": "image",
+            "data": base64.b64encode(make_png(16, 8)).decode(),
+            "mimeType": "image/png",
+            "display": True,
+        }]
+
+    registry = ToolRegistry()
+    registry.register(
+        shot, name="shot", description="takes a picture",
+        parameters={"type": "object", "properties": {"what": {"type": "string"}}},
+    )
+    client = FakeClient(assistant_turn(
+        ("c1", "shot", json.dumps({"what": "first"})),
+        ("c2", "shot", json.dumps({"what": "second"})),
+    ))
+    engine = ChatEngine(settings, store, media, client, tool_registry=registry)
+
+    with pytest.raises(asyncio.CancelledError):
+        async for _frame in engine.stream_turn(uuid):
+            pass
+
+    written = store.load(uuid).messages
+    assert_paired(written)
+    shown = last_assistant(written)["_display"]
+    assert len(shown) == 1
+    assert shown[0]["url"].startswith(f"/memory/{uuid}/")
+    # And the next turn can still be served: nothing about the cut broke the group.
+    engine.prepare_messages(store.load(uuid))
+
+
+def test_a_marked_block_costs_nothing_to_keep(store, media, settings):
+    """It is never inlined, so it must not be dropped by the media budget either."""
+    import base64 as b64
+
+    marked = [{
+        "type": "image",
+        "url": f"/memory/{'a' * 32}/shown.png",
+        "mime": "image/png",
+        "display": True,
+    }]
+    block = tool_message_with_image("c1")
+    block["content"] = json.dumps(marked)
+
+    out = rehydrate([user("go"), assistant("c1"), block], media, settings, media_root=store.root)
+
+    assert roles(out) == ["user", "assistant", "tool"]
+    text = json.dumps(out[-1]["content"])
+    assert "was shown to the user" in text
+    assert "data:image" not in text
+

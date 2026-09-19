@@ -328,7 +328,7 @@ def text_of(result) -> str:
 def test_the_expected_tools_are_registered(toolset):
     assert set(toolset) == {
         "resize_image", "compress_image", "inspect_media",
-        "reduce_video_frames", "compress_video", "read_file",
+        "reduce_video_frames", "compress_video", "display_media", "read_file",
     }
 
 
@@ -346,7 +346,7 @@ def test_the_registry_accepts_prebuilt_tools(registry):
     # `register` takes a callable and would raise AttributeError here.
     with pytest.raises(AttributeError):
         registry.register(Tool(name="x", description="d", handler=lambda: 1))
-    assert len(registry) == 6
+    assert len(registry) == 7
 
 
 async def test_inspect_media_reports_dimensions(registry, media):
@@ -527,7 +527,7 @@ async def test_a_tool_that_raises_becomes_an_error_result(registry, media):
 
 def test_tools_are_usable_with_the_registry(registry):
     """`ToolRegistry.add` takes Tool objects; `register` takes callables."""
-    assert len(registry) == 6
+    assert len(registry) == 7
     assert "resize_image" in registry
 
 
@@ -681,3 +681,247 @@ async def test_compress_video_writes_something_a_browser_can_play(registry, stor
         capture_output=True, text=True, timeout=60,
     ).stdout.strip()
     assert codec == "h264"
+
+
+# ── media meant for the person ────────────────────────────────────────────────
+#
+# Two audiences, two destinations. A block the model is meant to see stays in the
+# tool result and is inlined into the next request; a block that exists so the *user*
+# can look at it is marked, cut out of the tool result, and hung on the assistant's
+# reply instead. The marker has to survive ingestion, which is the part with a real
+# failure mode: `ingest_tool_blocks` rewrites a block as it saves it, and a rewrite
+# that dropped an unknown key would silently turn every display back into vision.
+
+@pytest.fixture
+def outside(tmp_path):
+    """A directory outside the memory tree and outside the conversation."""
+    path = tmp_path / "outside"
+    path.mkdir()
+    return path
+
+
+def registry_of(store, media, settings, *, uuid: str = "conv1"):
+    """The built-ins wired the way the app wires them, reached the way the model does."""
+    from deepseek_client.tools import ToolRegistry
+
+    store.create(uuid=uuid)
+    reg = ToolRegistry()
+    for tool in build_media_tools(store, media, lambda: uuid, settings=settings):
+        reg.add(tool)
+    return reg
+
+
+@pytest.fixture
+def display_settings(store, outside):
+    """Settings with one extra display root, the way MEDIA_DISPLAY_ROOTS adds one."""
+    return load_settings(
+        {}, load_dotenv=False, memory_root=store.root, media_display_roots=(outside,)
+    )
+
+
+@pytest.fixture
+def display_registry(store, media, display_settings):
+    return registry_of(store, media, display_settings)
+
+
+def test_only_a_marked_media_block_is_for_the_user():
+    from server.media import is_display_block
+
+    assert is_display_block({"type": "image", "url": "/memory/c1/a.png", "display": True})
+    assert not is_display_block({"type": "image", "url": "/memory/c1/a.png"})
+    assert not is_display_block({"type": "text", "text": "hi", "display": True})
+    # A marker with nothing to point at is not something to show.
+    assert not is_display_block({"type": "image", "display": True})
+
+
+def test_splitting_a_result_leaves_the_model_its_own_media():
+    from server.media import split_display_blocks
+
+    shown, kept = split_display_blocks([
+        {"type": "text", "text": "two pictures"},
+        {"type": "image", "url": "/memory/c1/for_user.png", "display": True},
+        {"type": "image", "url": "/memory/c1/for_model.png"},
+    ])
+
+    assert [b["url"] for b in shown] == ["/memory/c1/for_user.png"]
+    assert [b.get("url") or b.get("text") for b in kept] == ["two pictures", "/memory/c1/for_model.png"]
+
+
+def test_marking_does_not_touch_the_blocks_it_was_given():
+    from server.media import mark_display_blocks
+
+    original = [{"type": "image", "url": "/memory/c1/a.png"}, {"type": "text", "text": "x"}]
+    marked = mark_display_blocks(original)
+
+    assert marked[0]["display"] is True
+    assert "display" not in original[0]
+    assert marked[1] == {"type": "text", "text": "x"}
+
+
+def test_the_note_left_behind_names_the_path_to_look_at():
+    from server.media import display_note
+
+    note = display_note({"type": "image", "url": "/memory/c1/monkey.png", "name": "monkey.png"})
+
+    assert "monkey.png" in note
+    assert "/memory/c1/monkey.png" in note
+    assert "inspect_media" in note
+
+
+def test_ingesting_a_marked_block_keeps_the_marker(media, store):
+    """The rewrite is where a marker could go missing, and nothing else would say so."""
+    import base64
+
+    store.create(uuid="conv1")
+    blocks = media.ingest_tool_blocks("conv1", [{
+        "type": "image",
+        "data": base64.b64encode(make_image(24, 12)).decode(),
+        "mimeType": "image/png",
+        "display": True,
+    }], "web_fetch")
+
+    from server.media import is_display_block
+
+    assert is_display_block(blocks[0])
+    assert blocks[0]["url"].startswith("/memory/conv1/")
+    assert not blocks[0].get("data"), "the bytes belong on disk, not in the block"
+
+
+# ── the display_media tool ────────────────────────────────────────────────────
+
+async def test_display_media_shows_a_file_from_the_conversation(display_registry, media, store):
+    url = media.save_bytes("conv1", make_image(320, 160), "image/png", name="chart.png")
+
+    result = await call(display_registry, "display_media", path=url, caption="the chart")
+
+    assert not result.is_error
+    block = result.content[1]
+    assert block["type"] == "image"
+    assert block["display"] is True
+    assert block["caption"] == "the chart"
+    # The name is the file's, not the caption's: the caption is the human label and
+    # `name` is what is actually on disk, which is what the model gets told to look at.
+    assert block["name"] == media.path_for_url(url).name
+    assert block["width"] == 320 and block["height"] == 160
+    assert "not attached to this request" in text_of(result)
+    # The path the model is told to look at is the durable copy, not the file it named.
+    assert block["url"] in text_of(result)
+    assert result.meta["path"] == block["url"]
+
+
+async def test_display_media_reads_a_project_file_the_other_tools_refuse(display_registry, media, outside):
+    """The whole reason the tool exists: `web_fetch` puts its images outside memory/."""
+    source = outside / "downloaded.jpg"
+    source.write_bytes(make_image(40, 20, fmt="JPEG"))
+
+    refused = await call(display_registry, "inspect_media", path=str(source))
+    assert refused.is_error, "every other tool is still conversation-only"
+
+    result = await call(display_registry, "display_media", path=str(source))
+    assert not result.is_error
+    block = result.content[1]
+    assert block["type"] == "image"
+    assert block["name"] == "downloaded.jpg"
+    # Copied in, not linked to: `web_fetch` wipes its download directory, and a
+    # transcript that points into it would rot.
+    assert block["url"].startswith("/memory/conv1/")
+    assert media.path_for_url(block["url"]).is_file()
+    assert source.is_file()
+
+
+async def test_display_media_takes_a_name_relative_to_a_display_root(display_registry, outside):
+    (outside / "clip.gif").write_bytes(make_image(16, 16, fmt="GIF"))
+
+    result = await call(display_registry, "display_media", path="clip.gif")
+
+    assert not result.is_error
+    assert result.content[1]["mime"] == "image/gif"
+
+
+async def test_display_media_cannot_be_used_to_read_another_conversation(display_registry, media, store):
+    """A /memory/ URL from someone else's conversation is not a way around `_resolve`."""
+    other = "aaaaaaaaaaaa4aaaaaaaaaaaaaaaaaaa"
+    store.create(uuid=other)
+    url = media.save_bytes(other, make_image(8, 8), "image/png", name="secret.png")
+
+    result = await call(display_registry, "display_media", path=url)
+
+    assert result.is_error
+    assert "secret.png" not in text_of(result)
+
+
+async def test_display_media_refuses_the_media_directory_even_when_it_is_a_root(store, media):
+    """MEDIA_ROOT is normally *inside* the project root, i.e. inside a display root.
+
+    So the wider read scope has to subtract it explicitly. A display that could reach
+    into `memory/` would hand one conversation another conversation's file, which is
+    the one thing the per-conversation boundary exists to prevent.
+    """
+    settings = load_settings(
+        {}, load_dotenv=False, memory_root=store.root, media_display_roots=(store.root,)
+    )
+    registry = registry_of(store, media, settings)
+    other = "bbbbbbbbbbbb4bbbbbbbbbbbbbbbbbbb"
+    store.create(uuid=other)
+    url = media.save_bytes(other, make_image(8, 8), "image/png", name="secret.png")
+    on_disk = media.path_for_url(url)
+    assert on_disk is not None and on_disk.is_absolute()
+
+    result = await call(registry, "display_media", path=str(on_disk))
+
+    assert result.is_error
+    assert "media directory" in text_of(result)
+    assert "/memory/" in text_of(result)
+
+
+async def test_display_media_refuses_a_path_that_escapes_the_roots(display_registry, tmp_path):
+    secret = tmp_path / "elsewhere" / "secret.png"
+    secret.parent.mkdir()
+    secret.write_bytes(make_image())
+
+    result = await call(display_registry, "display_media", path=str(secret))
+
+    assert result.is_error
+
+
+async def test_display_media_refuses_something_that_is_not_media(display_registry, outside):
+    (outside / "notes.md").write_text("# not a picture\n", encoding="utf-8")
+
+    result = await call(display_registry, "display_media", path=str(outside / "notes.md"))
+
+    assert result.is_error
+    assert "cannot be shown inline" in text_of(result)
+    assert "read_file" in text_of(result)
+
+
+async def test_display_media_reports_a_missing_file(display_registry):
+    result = await call(display_registry, "display_media", path="conv1/nothing-here.png")
+
+    assert result.is_error
+
+
+async def test_display_media_refuses_an_empty_file(display_registry, outside):
+    (outside / "empty.png").write_bytes(b"")
+
+    result = await call(display_registry, "display_media", path=str(outside / "empty.png"))
+
+    assert result.is_error
+    assert "empty" in text_of(result)
+
+
+async def test_display_media_needs_a_path(display_registry):
+    result = await call(display_registry, "display_media", path="")
+
+    assert result.is_error
+    assert "path is required" in text_of(result)
+
+
+async def test_display_media_classifies_audio_from_its_bytes(display_registry, outside):
+    """No extension to trust: `sniff_mime` sees `OggS` and calls it audio."""
+    (outside / "sound.dat").write_bytes(b"OggS" + b"\x00" * 64)
+
+    result = await call(display_registry, "display_media", path=str(outside / "sound.dat"))
+
+    assert not result.is_error
+    assert result.content[1]["type"] == "audio"
+

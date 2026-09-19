@@ -31,6 +31,8 @@ from typing import Any, Iterable, Sequence
 
 from deepseek_client.messages import image_tokens
 
+from .media import display_note, is_display_block
+
 __all__ = ["rehydrate", "strip_ui_blocks", "count_images", "MediaBudget"]
 
 logger = logging.getLogger("deepseek_ui.rehydrate")
@@ -123,7 +125,10 @@ def rehydrate(
         if message.get("role") != "tool":
             continue
         blocks = _decode_tool_content(message.get("content"))
-        if blocks and any(b.get("type") in ("image", "video") for b in blocks):
+        if blocks and any(
+            b.get("type") in ("image", "video") and not is_display_block(b)
+            for b in blocks
+        ):
             media_indices.append(index)
 
     keep_media: set[int] = set()
@@ -131,6 +136,8 @@ def rehydrate(
         blocks = _decode_tool_content(messages[index].get("content")) or []
         cost = 0
         for block in blocks:
+            if is_display_block(block):
+                continue                 # never inlined, so it costs nothing to keep
             if block.get("type") == "image":
                 cost += _IMAGE_COST
             elif block.get("type") == "video":
@@ -208,6 +215,13 @@ def rehydrate(
 
         for block in blocks:
             btype = block.get("type")
+
+            if is_display_block(block):
+                # Media that exists to be shown rather than to be seen. The engine cuts
+                # it out of the result as it stores it, so reaching here means an older
+                # transcript, or one edited by hand — the rule holds either way.
+                text_parts.append(display_note(block))
+                continue
 
             if btype == "text":
                 text_parts.append(str(block.get("text") or ""))

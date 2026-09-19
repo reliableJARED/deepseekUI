@@ -56,6 +56,13 @@ MAX_TOOL_STEPS_VAR = "MAX_TOOL_STEPS"
 MIN_TOOL_STEPS = 1
 MAX_TOOL_STEPS_LIMIT = 100
 
+#: Extra directories the media-display tool may read from, ``;``-separated. The
+#: project directory is always allowed (minus the media tree), so a tool that drops
+#: a file beside the code — MCP's ``web_media/`` is the one that exists today — is
+#: reachable with no configuration at all. This is for media that lands somewhere
+#: else entirely: a renders folder, a scratch directory, another drive.
+MEDIA_DISPLAY_ROOTS_VAR = "MEDIA_DISPLAY_ROOTS"
+
 __all__ = [
     "Settings",
     "load_settings",
@@ -66,6 +73,7 @@ __all__ = [
     "MAX_TOOL_STEPS_VAR",
     "MIN_TOOL_STEPS",
     "MAX_TOOL_STEPS_LIMIT",
+    "MEDIA_DISPLAY_ROOTS_VAR",
     "is_usable_key",
     "mask_key",
     "read_env_var",
@@ -101,6 +109,25 @@ def _as_float(value: Any, default: float) -> float:
         return float(str(value))
     except (TypeError, ValueError):
         return default
+
+
+def _as_paths(value: Any) -> tuple[Path, ...]:
+    """Parse a ``;``-separated list of directories from one environment value.
+
+    ``;`` rather than ``os.pathsep``, even on Windows where they are the same thing:
+    the alternative separator is ``:``, which is a drive letter, so a value following
+    the platform would be unparseable on the platform most likely to need it. A
+    relative entry resolves against the project root, which is the only directory it
+    could sensibly mean.
+    """
+    roots: list[Path] = []
+    for part in str(value or "").split(";"):
+        cleaned = part.strip().strip('"').strip("'")
+        if not cleaned:
+            continue
+        path = Path(cleaned).expanduser()
+        roots.append(path if path.is_absolute() else (PROJECT_ROOT / path).resolve())
+    return tuple(roots)
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +183,10 @@ class Settings:
     #: MCP servers, as loaded from `mcp.json` (see `server/mcp.py`).
     mcp_config_path: Path = PROJECT_ROOT / "mcp.json"
 
+    #: Extra directories the media-display tool may read from, on top of the project
+    #: directory. See :meth:`display_roots` and ``MEDIA_DISPLAY_ROOTS_VAR``.
+    media_display_roots: tuple[Path, ...] = ()
+
     #: Values changed at runtime from the settings panel.
     #:
     #: One `Settings` instance is shared by the engine, the route closures and the
@@ -176,6 +207,32 @@ class Settings:
     def override(self, **values: Any) -> None:
         """Record live overrides for the running process. See :attr:`runtime`."""
         self.runtime.update(values)
+
+    def display_roots(self) -> tuple[Path, ...]:
+        """Directories a display tool may read from, in order.
+
+        The conversation's own directory is deliberately *absent*: it is per-request,
+        and the tool adds it. This is the part that is the same for every
+        conversation — the project directory, so a tool that drops a file beside the
+        code (MCP's ``web_media/`` is the one that exists today) is reachable with no
+        configuration, plus anything ``MEDIA_DISPLAY_ROOTS`` adds.
+
+        The media tree is not filtered out here, it cannot be: it is a *subdirectory*
+        of a root, not a root. Excluding it is the caller's job, and the tool does it,
+        because ``memory/`` holds every conversation's files — allowing it would undo
+        the per-conversation boundary the built-in tools exist to enforce.
+        """
+        seen: set[Path] = set()
+        roots: list[Path] = []
+        for candidate in (PROJECT_ROOT, *self.media_display_roots):
+            try:
+                root = Path(candidate).expanduser().resolve()
+            except (OSError, ValueError):                # pragma: no cover - defensive
+                continue
+            if root not in seen and root.is_dir():
+                seen.add(root)
+                roots.append(root)
+        return tuple(roots)
 
     def media_root_for(self, uuid: str) -> Path:
         return self.memory_root / uuid
@@ -491,6 +548,7 @@ def load_settings(
         max_tool_steps=min(_as_int(var(MAX_TOOL_STEPS_VAR), 8), MAX_TOOL_STEPS_LIMIT),
         request_timeout=_as_float(var("REQUEST_TIMEOUT"), 300.0),
         mcp_config_path=Path(var("MCP_CONFIG") or PROJECT_ROOT / "mcp.json"),
+        media_display_roots=_as_paths(var(MEDIA_DISPLAY_ROOTS_VAR)),
     )
 
     if overrides:

@@ -138,6 +138,21 @@ function mediaGrid(blocks) {
   return grid.children.length ? grid : null;
 }
 
+/**
+ * The media a tool showed to *you* rather than to the model.
+ *
+ * The server cuts these out of the tool result, stores them on the assistant turn as
+ * `_display`, and they render above the reply — the point of asking to see something
+ * is to have it be the first thing you look at, not a card you have to open. The key
+ * is deliberately underscore-prefixed, which is what keeps it out of the request.
+ */
+function displayMedia(blocks) {
+  if (!Array.isArray(blocks) || !blocks.length) return null;
+  const grid = mediaGrid(blocks);
+  if (grid) grid.classList.add('shown-media');
+  return grid;
+}
+
 /** Render a message's blocks into `container`: text first, then media, then code. */
 function renderBlocks(container, blocks) {
   const texts = blocks.filter((b) => b.type === 'text');
@@ -350,6 +365,9 @@ function renderMessage(message, { onEdit = null, onRegenerate = null, isLast = f
     bubble.append(details);
   }
 
+  const shown = role === 'assistant' ? displayMedia(message._display) : null;
+  if (shown) bubble.append(shown);
+
   if (blocks.length) renderBlocks(bubble, blocks);
 
   if (role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length && !blocks.length) {
@@ -538,6 +556,11 @@ function createTurnPainter() {
   let reasoningText = '';
   const reasonings = h('div');
   const stream = h('div', 'prose live-body');
+  // Media the tools hand over mid-turn. It has to land above the streaming text,
+  // because the disk re-render at the end of the turn puts it there — and a turn that
+  // jumped around while it ran would be worse than no live paint at all.
+  const shownRow = h('div', 'media-grid shown-media');
+  let shownCount = 0;
   let streamText = '';
   const events = h('div');
   const cards = new Map();
@@ -645,7 +668,7 @@ function createTurnPainter() {
       scrollToBottom();
     },
 
-    toolResult(id, name, isError, blocks, step) {
+    toolResult(id, name, isError, blocks, step, media) {
       let card = cards.get(id);
       if (!card) {
         card = toolCard(name, id);
@@ -653,6 +676,16 @@ function createTurnPainter() {
         events.append(card);
       }
       finishToolCard(card, { isError, blocks, step });
+      if (Array.isArray(media) && media.length) {
+        // Prepended, not appended: the transcript re-render at the end of the turn
+        // builds media-before-cards-before-text from disk, and the live paint should
+        // not visibly reshuffle when that happens.
+        if (!shownCount) events.prepend(shownRow);
+        for (const block of media) {
+          if (isMediaBlock(block)) shownRow.append(elementForBlock(block, { onZoom: openLightbox }));
+        }
+        shownCount += media.length;
+      }
       scrollToBottom();
     },
 
@@ -760,7 +793,7 @@ async function runTurn({ content, displayContent, resend = false } = {}) {
           painter.toolCall(data.id, data.name, data.arguments, data.raw_arguments);
           break;
         case 'tool_result':
-          painter.toolResult(data.id, data.name, Boolean(data.is_error), data.blocks, data.step);
+          painter.toolResult(data.id, data.name, Boolean(data.is_error), data.blocks, data.step, data.media);
           break;
         case 'usage':
           painter.setUsage(data);

@@ -20,7 +20,7 @@ from deepseek_client.config import REASONING_EFFORTS
 from . import __version__
 from .llm import ChatEngine, make_client_factory
 from .mcp import MCPManager, load_mcp_config
-from .media import MediaStore
+from .media import MediaStore, mark_display_blocks
 from .routes import create_routes, make_middleware
 from .settings import ensure_env_file, ensure_mcp_file, load_environ, load_settings
 from .store import ConversationStore
@@ -111,8 +111,17 @@ class AppState:
         return registry
 
     def _ingest_tool_media(self, uuid: str, blocks, tool_name: str):
-        """Callback MCP tools use to persist the media they return."""
-        return self.media.ingest_tool_blocks(uuid, blocks, tool_name)
+        """Callback MCP tools use to persist the media they return.
+
+        Everything an MCP tool returns is marked user-facing. The reasoning is that a
+        remote tool hands back media because a *person* asked to see something
+        (``web_fetch`` downloads the images on the page it read), and leaving it in the
+        result is what buried it in a collapsed tool card. The model still gets each
+        file's path in place of the media, and can pull one back into its own vision
+        with ``resize_image`` or ``reduce_video_frames`` if it genuinely needs to look.
+        """
+        blocks = self.media.ingest_tool_blocks(uuid, blocks, tool_name)
+        return mark_display_blocks(blocks)
 
     async def refresh_client(self) -> None:
         """Drop the cached model client so the next request re-reads `.env`.

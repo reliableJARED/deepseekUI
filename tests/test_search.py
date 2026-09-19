@@ -356,7 +356,159 @@ def test_an_unreachable_api_is_unavailable(gemini):
     assert "could not reach Gemini" in str(raised.value)
 
 
-# ── web_fetch: a download and a tag strip, and NO model ───────────────────────
+# ── grounding redirects become real publisher URLs ────────────────────────────
+# Gemini reports every source as an opaque hop on its own host —
+# vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQ... — which names
+# Google rather than the publisher, is unreadable without opening it, and carries a
+# signature that expires. The caller only reports what this server hands it, so the
+# hop is taken here, once per source, before the summary is written.
+#
+# These stay offline: ``_resolve_redirect`` is the only thing that touches the
+# network, so every test either stubs it or stubs ``urlopen`` beneath it.
+
+REDIRECT = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQsig"
+
+
+class _Hop:
+    """Stands in for the response object ``urlopen`` returns.
+
+    ``geturl()`` is the whole contract. urlopen completes the redirect chain before
+    it returns, so the final address is already in hand and the body never has to be
+    read — which is what keeps a resolution to one round-trip of headers instead of
+    a page download per source.
+    """
+
+    def __init__(self, final, body=b""):
+        self._final = final
+        self._body = body
+
+    def geturl(self):
+        return self._final
+
+    def read(self, size=-1):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _hop(monkeypatch, final, body=b""):
+    monkeypatch.setattr(mcpserver.urllib.request, "urlopen",
+                        lambda request, timeout=None: _Hop(final, body))
+
+
+def test_only_google_grounding_hops_count_as_redirects():
+    assert mcpserver._is_grounding_redirect(REDIRECT)
+    # The whole host is the grounding redirector, so any path on it is a hop.
+    assert mcpserver._is_grounding_redirect(
+        "https://vertexaisearch.cloud.google.com/anything")
+    # A source that is already a real URL must be left alone: rewriting one could
+    # only make it worse, and it would cost a request for nothing.
+    assert not mcpserver._is_grounding_redirect("https://python.org/downloads/")
+    assert not mcpserver._is_grounding_redirect("")
+    assert not mcpserver._is_grounding_redirect("https://cloud.google.com/vertex-ai")
+
+
+def test_a_real_url_is_never_opened(monkeypatch):
+    """The pass is a no-op for sources that are already publisher URLs."""
+    opened = []
+
+    def refuse(request, timeout=None):
+        opened.append(request)
+        raise AssertionError("no request should be made for a real URL")
+
+    monkeypatch.setattr(mcpserver.urllib.request, "urlopen", refuse)
+    assert mcpserver._resolve_sources([("A", "https://python.org/downloads/")]) == [
+        ("A", "https://python.org/downloads/")]
+    assert opened == []
+
+
+def test_a_redirect_is_swapped_for_the_url_it_lands_on(monkeypatch):
+    _hop(monkeypatch, "https://dreampixelforge.com/articles/x")
+    assert mcpserver._resolve_redirect(REDIRECT) == "https://dreampixelforge.com/articles/x"
+
+
+def test_a_hop_that_cannot_be_taken_keeps_the_original_url(monkeypatch):
+    """A working redirect is a worse citation than a publisher URL, but a far
+    better one than a dropped source."""
+
+    def boom(request, timeout=None):
+        raise OSError("tls handshake failed")
+
+    monkeypatch.setattr(mcpserver.urllib.request, "urlopen", boom)
+    assert mcpserver._resolve_redirect(REDIRECT) == ""
+    assert mcpserver._resolve_sources([("A", REDIRECT)]) == [("A", REDIRECT)]
+
+
+def test_a_200_that_still_points_at_the_hop_is_read_for_its_target(monkeypatch):
+    """Not every hop answers with a 3xx, and urllib will not follow one that does
+    not — the status was 200, so as far as it knows the request is over."""
+    _hop(monkeypatch, REDIRECT,
+         b'<html><head><meta http-equiv="refresh" '
+         b'content="0;url=https://real.test/a"></head></html>')
+    assert mcpserver._resolve_redirect(REDIRECT) == "https://real.test/a"
+
+
+def test_a_javascript_redirect_page_is_read_too(monkeypatch):
+    _hop(monkeypatch, REDIRECT, b'<script>location.href = "/relative/page";</script>')
+    # A relative target is normal on these pages, so it resolves against the hop.
+    assert mcpserver._resolve_redirect(REDIRECT) == (
+        "https://vertexaisearch.cloud.google.com/relative/page")
+
+
+def test_resolved_sources_keep_gemini_s_order(monkeypatch):
+    monkeypatch.setattr(mcpserver, "_resolve_redirect",
+                        lambda url: "https://publisher.test/" + url.rsplit("/", 1)[-1])
+    resolved = mcpserver._resolve_sources([("A", REDIRECT + "1"),
+                                           ("B", REDIRECT + "2"),
+                                           ("C", REDIRECT + "3")])
+    assert [title for title, _ in resolved] == ["A", "B", "C"]
+    assert [url for _, url in resolved] == ["https://publisher.test/AUZIYQsig1",
+                                            "https://publisher.test/AUZIYQsig2",
+                                            "https://publisher.test/AUZIYQsig3"]
+
+
+def test_two_hops_to_the_same_page_are_one_citation(monkeypatch):
+    """The same article under two signatures is one source, not two."""
+    monkeypatch.setattr(mcpserver, "_resolve_redirect",
+                        lambda url: "https://same.test/article")
+    assert mcpserver._resolve_sources([("A", REDIRECT + "a"),
+                                       ("A", REDIRECT + "b")]) == [
+        ("A", "https://same.test/article")]
+
+
+def test_only_the_reported_sources_are_followed(monkeypatch):
+    """The cap applies before the hops are taken: 20 sources means
+    SEARCH_MAX_SOURCES requests, not 20 resolved and then thrown away."""
+    followed = []
+    monkeypatch.setattr(mcpserver, "_resolve_redirect",
+                        lambda url: followed.append(url) or "")
+    mcpserver._resolve_sources([(f"S{i}", f"{REDIRECT}{i}") for i in range(20)])
+    assert len(followed) == mcpserver.SEARCH_MAX_SOURCES
+
+
+def test_resolution_can_be_turned_off(monkeypatch):
+    monkeypatch.setattr(mcpserver, "SEARCH_RESOLVE_REDIRECTS", False)
+    monkeypatch.setattr(mcpserver, "_resolve_redirect",
+                        lambda url: pytest.fail("must not be resolved"))
+    assert mcpserver._resolve_sources([("A", REDIRECT)]) == [("A", REDIRECT)]
+
+
+def test_the_summary_carries_publisher_urls_not_redirects(gemini, monkeypatch):
+    monkeypatch.setattr(mcpserver, "_resolve_redirect",
+                        lambda url: "https://dreampixelforge.com/articles/x")
+    gemini.reply = Response(text="An answer.",
+                            chunks=[_web(REDIRECT, "dreampixelforge.com")])
+    text = mcpserver._gemini_search("q", "K")
+    assert "1. dreampixelforge.com — https://dreampixelforge.com/articles/x" in text
+    # The redirect is the whole defect: it names Google, and it expires.
+    assert "vertexaisearch" not in text
+
+
+# ── web_fetch: a download plus a prune pass over an HTML tree, and NO model ───────
 
 def test_there_is_no_llm_in_the_fetch_path():
     """The whole point of the rewrite: nothing here can call a model.
@@ -385,13 +537,268 @@ def test_readable_text_drops_scripts_and_keeps_the_prose():
     )
     text = mcpserver._readable_text(html)
 
+    assert text.splitlines()[0] == "T"             # <title> is kept: it names the page
     assert "The actual sentence." in text
     assert "Second paragraph." in text
     assert "SECRET IN A SCRIPT" not in text      # script contents are not text
     assert "color: red" not in text              # nor are style contents
+    assert "a comment" not in text               # nor are comments
+    assert "Home" not in text                    # nor is <nav>, wherever it sits
     assert "<" not in text and ">" not in text   # every tag is gone
-    # Block-level elements became breaks, so the two paragraphs are not fused.
-    assert "The actual sentence.\nSecond paragraph." in text
+    # Block-level elements became breaks (a blank line, i.e. a paragraph), so the
+    # two paragraphs are not fused into one sentence.
+    assert "The actual sentence.\n\nSecond paragraph." in text
+
+
+# ── the prune pass ────────────────────────────────────────────────────────────
+# One page carrying every kind of furniture the pass knows about, with an article
+# underneath it. The rules are pinned one at a time against this instead of a live
+# URL, so the suite stays offline and a rule cannot silently stop firing.
+CHROME_PAGE = """<!doctype html>
+<html><head>
+  <title>Sprocket maintenance guide — Sprocket Co</title>
+  <meta name="description" content="How to grease a sprocket">
+  <link rel="stylesheet" href="/site.css">
+  <script>var ga = 'SECRET TRACKING';</script>
+  <style>.cookie { position: fixed }</style>
+</head><body>
+  <header class="site-header">
+    <img src="/img/hero.jpg" width="1200" height="400" alt="Sprocket Co">
+    <nav><a href="/">Home</a><a href="/about">About us</a></nav>
+  </header>
+  <div id="cookie-banner" class="cookie-consent">
+    We use cookies. <button>Accept all</button>
+  </div>
+  <main>
+    <article>
+      <header>
+        <h1>Sprocket maintenance guide</h1>
+        <p class="byline">By A. Machinist</p>
+      </header>
+      <p>The first thing to check is the chain tension.</p>
+      <figure><img data-src="/media/sprocket.jpg" alt="A sprocket"></figure>
+      <p>Lubricate every 300 kilometres.</p>
+    </article>
+    <aside class="newsletter-signup">Subscribe to our newsletter.</aside>
+  </main>
+  <footer><p>© 2026 Sprocket Co</p><a href="/legal">Legal</a></footer>
+</body></html>"""
+
+
+@pytest.fixture
+def chrome_text():
+    return mcpserver._readable_text(CHROME_PAGE)
+
+
+def test_the_article_survives_and_the_furniture_does_not(chrome_text):
+    assert "The first thing to check is the chain tension." in chrome_text
+    assert "Lubricate every 300 kilometres." in chrome_text
+    assert "SECRET TRACKING" not in chrome_text            # <script>
+    assert "position: fixed" not in chrome_text             # <style>
+    assert "Home" not in chrome_text                        # <nav>
+    assert "Accept all" not in chrome_text                  # cookie notice, by class
+    assert "Subscribe to our newsletter." not in chrome_text  # named chrome in <main>
+    assert "© 2026 Sprocket Co" not in chrome_text          # <footer>
+    assert "Legal" not in chrome_text
+    assert "How to grease a sprocket" not in chrome_text     # a <meta> is not text
+    assert "<" not in chrome_text and ">" not in chrome_text
+
+
+def test_an_articles_header_is_content_but_the_sites_header_is_furniture(chrome_text):
+    """The rule that needs a tree. HTML5 puts an article's title in its own <header>.
+
+    Dropping <header> by tag would delete the headline, the byline and the date —
+    the three lines a summary most needs — so header/footer/aside count as
+    furniture only OUTSIDE main/article. The same page proves both halves.
+    """
+    assert "By A. Machinist" in chrome_text                       # inside <article>
+    assert chrome_text.count("Sprocket maintenance guide") == 2   # <title> + the <h1>
+    assert "hero.jpg" not in chrome_text                          # the site <header>
+
+
+def test_a_void_element_does_not_swallow_the_page():
+    """`<meta>`, `<link>` and `<img>` never close, so stacking them nests the rest."""
+    text = mcpserver._readable_text(
+        '<html><body><img src="/x.jpg"><p>After the image.</p>'
+        '<meta charset="utf-8"><p>After the meta.</p></body></html>')
+    assert "After the image." in text
+    assert "After the meta." in text
+
+
+def test_the_note_says_a_pass_ran():
+    """The disclosure IS the safety mechanism: it is what stops a pruned section
+    being reported to the user as a section the page does not have."""
+    for html in (CHROME_PAGE, "<p>Bare prose.</p>", "<div>No tags of interest.</div>"):
+        assert mcpserver._readable_text(html).endswith(mcpserver.PRUNE_NOTE)
+
+
+def test_a_page_that_is_all_furniture_still_comes_back():
+    """Empty output would read as "this page has no text", which is a worse lie
+    than the boilerplate it was trying to avoid."""
+    text = mcpserver._readable_text(
+        "<html><body><div class='cookie-consent'>Accept all cookies</div>"
+        "</body></html>")
+    assert "Accept all cookies" in text
+    assert mcpserver.PRUNE_NOTE in text
+
+
+def test_a_soft_hint_counts_outside_the_article_and_not_inside_it():
+    """A page can legitimately be *about* a sidebar, so inside main only the
+    unambiguous hints — cookie, share, newsletter, ad — are trusted."""
+    text = mcpserver._readable_text(
+        "<html><body>"
+        "<div class='sidebar'><p>Site sidebar.</p></div>"
+        "<main><article><p>Article prose.</p></article>"
+        "<div class='sidebar'><p>Sidebar prose in main.</p></div>"
+        "<div class='newsletter-signup'><p>Named chrome in main.</p></div>"
+        "</main></body></html>")
+    assert "Article prose." in text
+    assert "Site sidebar." not in text                # soft hint, outside main
+    assert "Sidebar prose in main." in text           # soft hint, inside main: kept
+    assert "Named chrome in main." not in text        # hard hint: dropped anywhere
+
+
+def test_a_link_farm_goes_but_a_table_of_contents_keeps_its_links():
+    links = "".join(
+        f"<li><a href='/p{i}'>Chapter {i} of the field manual</a></li>" for i in range(20))
+    chapter = "Chapter 7 of the field manual"
+
+    farm = ("<html><body><article><p>Real prose.</p></article>"
+            f"<div id='related'><ul>{links}</ul></div></body></html>")
+    text = mcpserver._readable_text(farm)
+    assert "Real prose." in text
+    assert chapter not in text
+
+    # The same links one level under a heading: that is a contents list, and it is
+    # often the most useful thing on a documentation page.
+    toc = (f"<html><body><section><h2>On this page</h2><ul>{links}</ul></section>"
+           "</body></html>")
+    assert chapter in mcpserver._readable_text(toc)
+
+
+def test_the_note_survives_the_cap(monkeypatch):
+    """A truncated reply must still say that a pass ran, or the cut reads as
+    "the page ends here"."""
+    monkeypatch.setattr(mcpserver, "FETCH_BODY_CAP", 60)
+    text = mcpserver._readable_text("<p>" + "prose " * 200 + "</p>")
+    assert text.count("prose") < 20                  # the body was cut short
+    assert text.endswith(mcpserver.PRUNE_NOTE)       # the disclosure was not
+
+
+def test_the_cap_is_spent_on_content_and_not_on_chrome(monkeypatch):
+    """The saving that matters. The cap is 60k characters, and a chrome-heavy page
+    used to spend them on nav and cookie notices, so the text was truncated BEFORE
+    the article began. Pruning moves the truncation point back."""
+    monkeypatch.setattr(mcpserver, "FETCH_BODY_CAP", 120)
+    nav = "<nav>" + "".join(f"<a href='/{i}'>Link {i}</a>" for i in range(50)) + "</nav>"
+    text = mcpserver._readable_text(
+        f"<html><body>{nav}<article><h1>Title</h1>"
+        "<p>The article body.</p></article></body></html>")
+    assert "The article body." in text
+
+
+def test_a_page_that_is_only_links_comes_back_whole_rather_than_empty():
+    """An index or an archive page IS a list of links.
+
+    Pruning it to nothing would be reported as "this page has no text", which is a
+    worse lie than the boilerplate the prune was trying to avoid, so a page the
+    heuristic empties is handed over whole — still with the note.
+    """
+    links = "".join(
+        f"<li><a href='/p{i}'>Chapter {i} of the field manual</a></li>" for i in range(20))
+    text = mcpserver._readable_text(f"<html><body><ul>{links}</ul></body></html>")
+    assert "Chapter 7 of the field manual" in text
+    assert mcpserver.PRUNE_NOTE in text
+
+
+def test_nested_svg_sprites_do_not_leak_out_as_text():
+    """The case the old regex strip got wrong: `<svg>` inside `<svg>` left the rest
+    of the sprite in the text, because `.*?</svg>` stops at the first close tag.
+    The tree closes the nearest matching tag instead."""
+    text = mcpserver._readable_text(
+        "<html><body><svg width='0'><svg><text>SPRITE LEAK</text></svg></svg>"
+        "<p>Real prose.</p></body></html>")
+    assert "Real prose." in text
+    assert "SPRITE LEAK" not in text
+
+
+def test_unbalanced_tags_keep_their_text():
+    """Every real page has a stray close tag; one must not flatten what follows."""
+    text = mcpserver._readable_text(
+        "<html><body><div><p>First.</p></div></div></div>"
+        "<main><p>Second.</p></main></body></html>")
+    assert "First." in text and "Second." in text
+
+
+def test_a_parser_failure_falls_back_to_the_plain_strip(monkeypatch):
+    """html.parser is tolerant but not obliged to be. On a construct it rejects,
+    the fetch still returns text rather than "No readable text found"."""
+    def boom(body):
+        raise RuntimeError("bad construct")
+
+    monkeypatch.setattr(mcpserver, "_build_tree", boom)
+    text = mcpserver._readable_text("<script>x</script><p>Stubborn prose.</p>")
+    assert "Stubborn prose." in text
+    assert mcpserver.PRUNE_NOTE in text
+
+
+def test_a_page_with_no_text_at_all_is_still_empty():
+    """An empty answer is for a page that has nothing, not for a page that has
+    something the heuristic could not read."""
+    assert mcpserver._readable_text("<html><head><title></title></head></html>") == ""
+
+
+def test_content_images_are_read_from_the_pruned_tree():
+    """No logo heuristic was added: the site <header> the logo lived in is gone
+    before the images are looked for, so the logo is never a candidate."""
+    root = mcpserver._parse_and_prune(CHROME_PAGE)
+    assert mcpserver._images_from_tree(root, "https://sprocket.test/guide") == [
+        "https://sprocket.test/media/sprocket.jpg"]
+
+
+def test_article_images_win_the_cap_over_the_pages_chrome(monkeypatch):
+    """Document order alone spends the small cap on a hero and three icons before
+    reaching the diagrams in the body, so article/figure images are ranked first."""
+    monkeypatch.setattr(mcpserver, "FETCH_MAX_IMAGES", 2)
+    root = mcpserver._parse_and_prune(
+        "<html><body><div class='hero'><img src='/lead.jpg'></div>"
+        "<article><img src='/body-1.jpg'><img src='/body-2.jpg'></article>"
+        "</body></html>")
+    assert mcpserver._images_from_tree(root, "https://x.test/guide") == [
+        "https://x.test/body-1.jpg", "https://x.test/body-2.jpg"]
+
+
+def test_a_lazy_loaded_image_is_read_from_its_real_attribute():
+    """A page that lazy-loads puts a 1x1 placeholder in `src` and the image in
+    `data-src`/`data-srcset`, so reading `src` first would fetch a blank gif."""
+    root = mcpserver._parse_and_prune(
+        "<html><body><article>"
+        "<img src='/blank.gif' data-src='/real.jpg'>"
+        "<img data-srcset='/big.jpg 1x, /big@2x.jpg 2x'>"
+        "</article></body></html>")
+    assert mcpserver._images_from_tree(root, "https://x.test") == [
+        "https://x.test/real.jpg", "https://x.test/big.jpg"]
+
+
+def test_a_declared_size_is_only_read_when_it_is_pixels():
+    """`width='100%'` is not a 100-pixel icon; a responsive image is content."""
+    root = mcpserver._parse_and_prune(
+        "<html><body><article><img src='/percent.jpg' width='100%' height='100%'>"
+        "<img src='/icon.png' width='120' height='90'>"
+        "<img src='/plain.jpg'></article></body></html>")
+    assert mcpserver._images_from_tree(root, "https://x.test") == [
+        "https://x.test/percent.jpg", "https://x.test/plain.jpg"]
+
+
+def test_the_tool_says_that_a_prune_pass_runs_and_offers_no_way_out_of_it():
+    """There is no `full=true`: the text always comes back pruned, so the sentence
+    in the tool description and the note in the reply carry the disclosure."""
+    fetch = next(tool for tool in mcpserver.TOOLS if tool["name"] == "web_fetch")
+    description = fetch["description"]
+    assert "removed" in description
+    assert "pruned" in description
+    assert list(fetch["inputSchema"]["properties"]) == ["url"]
+    assert "nothing was changed about the page" not in description
 
 
 def test_a_page_is_returned_as_plain_text_with_no_model_call(monkeypatch):
@@ -448,6 +855,60 @@ def test_a_failed_download_is_a_fetch_failure_not_a_crash(monkeypatch):
 
     monkeypatch.setattr(mcpserver, "_fetch_page", fetch)
     assert "Fetch failed" in mcpserver.call_tool("web_fetch", {"url": "a.test"})[0]["text"]
+
+
+# ── _fetch_page end to end, on a stubbed socket ───────────────────────────────
+
+class _FakeResponse:
+    """Just enough of an http.client response for _fetch_page."""
+
+    def __init__(self, body: bytes, ctype: str):
+        self.headers = {"Content-Type": ctype}
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _serve(monkeypatch, body: bytes, ctype: str):
+    monkeypatch.setattr(mcpserver.urllib.request, "urlopen",
+                        lambda req, timeout: _FakeResponse(body, ctype))
+
+
+def test_an_html_download_comes_back_pruned_noted_and_with_its_images(monkeypatch):
+    _serve(monkeypatch, CHROME_PAGE.encode(), "text/html; charset=utf-8")
+    text, images = mcpserver._fetch_page("https://sprocket.test/guide")
+
+    assert "The first thing to check is the chain tension." in text
+    assert "Accept all" not in text and "Legal" not in text
+    assert text.endswith(mcpserver.PRUNE_NOTE)
+    assert images == ["https://sprocket.test/media/sprocket.jpg"]
+
+
+def test_a_non_html_download_is_not_pruned_and_gets_no_note(monkeypatch):
+    """JSON has no page furniture, so saying a pass ran over it would be noise."""
+    _serve(monkeypatch, b'{"ok": true}', "application/json")
+    text, images = mcpserver._fetch_page("https://api.test/x.json")
+
+    assert text == '{"ok": true}'
+    assert mcpserver.PRUNE_NOTE not in text
+    assert images == []
+
+
+def test_html_served_as_plain_text_is_still_pruned(monkeypatch):
+    """Some servers mislabel a page; the body is the give-away, not the header."""
+    _serve(monkeypatch,
+           b"<!doctype html><html><body><nav>x</nav><p>Prose.</p></body></html>",
+           "text/plain")
+    text, _images = mcpserver._fetch_page("https://a.test/x")
+    assert "Prose." in text
+    assert mcpserver.PRUNE_NOTE in text
 
 
 # ── call_tool ─────────────────────────────────────────────────────────────────
@@ -548,6 +1009,9 @@ def test_initialize_advertises_both_tools_and_the_unavailable_caveat():
     # "this topic has no coverage".
     assert "unavailable" in info["instructions"]
     assert "web_fetch" in info["instructions"]
+    # ...and that a fetched page was pruned, so a gap in it is not reported to the
+    # user as a gap in the page.
+    assert "furniture" in info["instructions"]
 
 
 def test_tools_list_names_web_search_and_web_fetch():

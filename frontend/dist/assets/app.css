@@ -598,6 +598,15 @@ code, pre, .mono { font-family: var(--mono); font-size: .87em; }
 .media-cap a { color: var(--fg-dim); text-decoration: none; }
 .media-cap a:hover { color: var(--accent); }
 
+/* Media a tool handed straight to the user, cut out of its tool result and parked above
+   the reply. The rule is only a marker that it came from a tool and not from prose —
+   sizes are left to the .media-item rules above so the narrow-screen overrides still win. */
+.shown-media {
+  margin: 0 0 10px;
+  padding-left: 8px;
+  border-left: 2px solid var(--line-soft);
+}
+
 .file-chip {
   display: inline-flex; align-items: center; gap: 7px;
   margin: 6px 6px 0 0;

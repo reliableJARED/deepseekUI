@@ -29,7 +29,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 __all__ = [
     "MediaStore",
@@ -46,6 +46,11 @@ __all__ = [
     "text_document",
     "drop_partial_character",
     "classify_kind",
+    "DISPLAY_KEY",
+    "is_display_block",
+    "split_display_blocks",
+    "mark_display_blocks",
+    "display_note",
 ]
 
 logger = logging.getLogger("deepseek_ui.media")
@@ -796,3 +801,77 @@ class MediaStore:
             else:
                 out.append(dict(block))
         return out
+
+
+# ── media meant for the person, not for the model ─────────────────────────────
+
+#: Set on a tool's media block when the file is meant for the *user's* eyes.
+#:
+#: The two audiences are genuinely different, and which one a block serves has to
+#: ride on the block itself: by the time a result is being stored, nothing else
+#: knows.
+#:
+#: * an unmarked block feeds the model's vision — ``reduce_video_frames`` samples a
+#:   clip precisely so the model can describe it — so it stays in the tool message
+#:   and :mod:`server.rehydrate` inlines it into the next request;
+#: * a marked block exists to be *shown*: a page image ``web_fetch`` downloaded, a
+#:   file ``display_media`` was handed. It is cut out of the tool result, hung on the
+#:   assistant's turn so it renders above the answer, and deliberately not sent
+#:   upstream — the model can reach for ``inspect_media`` or ``resize_image`` with
+#:   the path it is given if it actually needs to look.
+DISPLAY_KEY = "display"
+
+
+def is_display_block(block: Any) -> bool:
+    """True for a media block that is for the user rather than for the model."""
+    return (
+        isinstance(block, dict)
+        and str(block.get("type") or "") in ("image", "video", "audio")
+        and bool(block.get("url"))
+        and bool(block.get(DISPLAY_KEY))
+    )
+
+
+def split_display_blocks(blocks: Sequence[Any]) -> tuple[list[dict], list[Any]]:
+    """Partition a tool result into ``(shown to the user, kept for the model)``."""
+    shown: list[dict] = []
+    kept: list[Any] = []
+    for block in blocks:
+        (shown if is_display_block(block) else kept).append(block)
+    return shown, kept
+
+
+def mark_display_blocks(blocks: Sequence[Any]) -> list[Any]:
+    """Copy ``blocks`` with the marker set on every media block.
+
+    For a source that is user-facing by nature rather than by intent: an MCP tool
+    returns media because a person asked to see something — ``web_fetch`` downloads
+    the images on the page it read — so there is no per-block decision to make and no
+    place in the tool to make it.
+    """
+    out: list[Any] = []
+    for block in blocks:
+        if (
+            isinstance(block, dict)
+            and str(block.get("type") or "") in ("image", "video", "audio")
+            and block.get("url")
+        ):
+            block = {**block, DISPLAY_KEY: True}
+        out.append(block)
+    return out
+
+
+def display_note(block: Mapping[str, Any]) -> str:
+    """The one line left in a tool result where media was cut out of it.
+
+    A pointer, not a summary: what the model has to end up with is the path, since
+    the bytes are on disk either way and every tool that can reach them takes a path.
+    """
+    url = str(block.get("url") or "")
+    kind = str(block.get("type") or "file")
+    name = str(block.get("name") or "") or url.rsplit("/", 1)[-1]
+    return (
+        f"[{kind} {name} was shown to the user and is not attached here. "
+        f"Its path is {url} — pass that path to inspect_media or read_file to look at it.]"
+    )
+

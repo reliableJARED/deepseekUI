@@ -11,7 +11,10 @@ Frame-count reduction matters for the same reason on video: a 90 second clip at
 1 fps is 90 images, ~92k tokens, for a scene that three frames would describe.
 
 Every path argument is resolved against the conversation directory and cannot
-escape it.
+escape it — with one deliberate exception: :func:`display_media`, whose whole job is
+to hand the user a file that a tool put *outside* the conversation (``web_fetch``
+writes its images into ``mcp_server/web_media/``). It reads wider, and it is
+user-only: what it shows is never attached to a request.
 """
 
 from __future__ import annotations
@@ -26,6 +29,8 @@ from typing import Any, Callable
 
 from deepseek_client.tools import Tool, ToolResult, tool_schema
 
+from .media import DISPLAY_KEY, classify_kind, sniff_mime
+from .settings import PROJECT_ROOT
 from .store import ConversationError
 
 __all__ = ["build_media_tools"]
@@ -37,6 +42,12 @@ ENCODE_TIMEOUT = 300
 
 #: Below this, DeepSeek upscales the image anyway, so shrinking further wastes detail.
 MIN_USEFUL_DIM = 544
+
+#: Nothing larger than this is copied into a conversation just to be shown. The copy
+#: is what makes a transcript survive its source being replaced — ``web_fetch`` wipes
+#: ``web_media/`` on every call, so a transcript pointing at it would rot — but a
+#: 4 GiB read is not a reasonable side effect of asking to see a file.
+MAX_DISPLAY_BYTES = 256 * 1024 * 1024
 
 
 def _url_for_attached_name(store, media, uuid: str, name: str) -> str | None:
@@ -125,6 +136,65 @@ def _resolve(store, media, uuid: str, path: str) -> Path:
 
 def _as_media_url(store, path: Path) -> str:
     return f"/memory/{path.parent.name}/{path.name}"
+
+
+def _display_roots(settings) -> tuple[Path, ...]:
+    """The read scope a display may use beyond the conversation itself."""
+    if settings is None:
+        return (PROJECT_ROOT,)
+    roots = getattr(settings, "display_roots", None)
+    return tuple(roots() if callable(roots) else roots or ())
+
+
+def _resolve_display(store, media, uuid: str, path: str, settings=None) -> Path:
+    """Resolve a path for *showing*, which reads wider than every other tool.
+
+    The conversation comes first and under the same rules as everything else — a
+    ``/memory/`` URL, a name in the conversation, the name a file was attached under,
+    or an absolute path inside it (see :func:`_resolve`). Only when that fails does the
+    wider scope apply: a path relative to, or inside, any of the configured display
+    roots, which by default is the project directory.
+
+    That wider scope is not a hole in the containment story, because unlike every
+    other path argument this one never feeds a request — the bytes are copied into the
+    conversation and shown to the person. The one thing that stays refused is the
+    media root itself: it holds *every* conversation's files, so resolving inside it
+    would hand one conversation another's file, which is exactly what
+    :func:`_resolve` exists to prevent.
+    """
+    if not path:
+        raise ValueError("path is required")
+
+    try:
+        return _resolve(store, media, uuid, path)
+    except ValueError as inside:
+        refused = inside
+
+    roots = _display_roots(settings)
+    if not roots:
+        raise refused
+
+    given = Path(path).expanduser()
+    candidates = [given] if given.is_absolute() else [root / given for root in roots]
+    memory_root = Path(store.root).resolve()
+
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except (OSError, ValueError):                    # pragma: no cover - defensive
+            continue
+        if not resolved.is_file():
+            continue
+        if not any(root == resolved or root in resolved.parents for root in roots):
+            continue
+        if memory_root == resolved or memory_root in resolved.parents:
+            raise ValueError(
+                "that file is inside the media directory, which holds every "
+                "conversation's files — refer to it by its /memory/ URL instead"
+            )
+        return resolved
+
+    raise refused
 
 
 def _image_block(store, media, path: Path) -> dict[str, Any]:
@@ -355,6 +425,75 @@ def build_media_tools(
                         limit = getattr(settings, "model_text_max_chars", 40_000)
                         info["inlined_on_attach"] = min(len(document.text), int(limit))
         return ToolResult(content=json.dumps(info, indent=2), meta=info)
+
+    # ── display_media ──
+    async def display_media(path: str, caption: str = "") -> ToolResult:
+        """Show a media file to the user, above the answer.
+
+        Nothing else in this module is for the person: every other tool exists to
+        change what the *model* gets to see. This one is the reverse — the file is
+        copied into the conversation, marked as user-facing, and cut out of the tool
+        result before it is stored, so it renders above the reply and never joins a
+        request. The model is told the path instead, which is what it can act on.
+        """
+        uuid = current()
+        try:
+            source = _resolve_display(store, media, uuid, path, settings)
+        except ValueError as exc:
+            return ToolResult.error(str(exc))
+
+        try:
+            data = source.read_bytes()
+        except OSError as exc:
+            return ToolResult.error(f"could not read {source.name}: {exc}")
+
+        if not data:
+            return ToolResult.error(f"{source.name} is empty")
+        if len(data) > MAX_DISPLAY_BYTES:
+            return ToolResult.error(
+                f"{source.name} is {_fmt_bytes(len(data))}, above the "
+                f"{_fmt_bytes(MAX_DISPLAY_BYTES)} limit for something that is copied "
+                "into the conversation just to be shown"
+            )
+
+        # Content decides, then the suffix: a `.jpg` that is really a PNG shows
+        # correctly, and a file with no extension at all still classifies.
+        mime = sniff_mime(data)
+        kind = classify_kind(data, mime, source.name)
+        if kind not in ("image", "video", "audio"):
+            return ToolResult.error(
+                f"{source.name} is {kind}, which cannot be shown inline. display_media "
+                "takes an image, video or audio file; read_file is how text reaches you."
+            )
+
+        url = media.save_bytes(uuid, data, mime, prefix=f"shown_{kind}", name=source.name)
+        block: dict[str, Any] = {
+            "type": kind,
+            "url": url,
+            "name": source.name,
+            "mime": mime,
+            DISPLAY_KEY: True,
+        }
+        dims = media.probe_size(data)
+        if kind == "image" and dims:
+            block["width"], block["height"] = dims
+        if caption:
+            block["caption"] = caption
+
+        detail = f", {_dims(dims)}" if kind == "image" and dims else ""
+        summary = (
+            f"Showing {source.name} to the user ({_fmt_bytes(len(data))}{detail}). "
+            "It is displayed above your reply and is not attached to this request — "
+            "you cannot see it here."
+            f"\nIts path is {url}."
+        )
+        if caption:
+            summary += f"\nShown with the caption: {caption}"
+
+        return ToolResult(
+            content=[{"type": "text", "text": summary}, block],
+            meta={"path": url, "kind": kind, "bytes": len(data), "shown": True},
+        )
 
     # ── reduce_video_frames ──
     async def reduce_video_frames(
@@ -599,6 +738,28 @@ def build_media_tools(
                 required=[],
             ),
             handler=inspect_media,
+        ),
+        Tool(
+            name="display_media",
+            description=(
+                "Show an image, video or audio file to the user. It is displayed above "
+                "your reply in the user's interface — and only there: the media is not "
+                "attached to this request, so calling this does not let you see the file. "
+                "Use it to hand over a result the user asked to see: a page image "
+                "web_fetch downloaded, a render, a recording. The path may be a file in "
+                "this conversation or any media file in the project directory. If you "
+                "need to see media yourself, use resize_image or reduce_video_frames, "
+                "which do return it to you."
+            ),
+            parameters=tool_schema(
+                "display_media",
+                properties={
+                    "path": {"type": "string", "description": "File to show: a /memory/ URL, a filename in this conversation, or a path inside the project directory."},
+                    "caption": {"type": "string", "description": "Optional short caption shown with the media.", "default": ""},
+                },
+                required=["path"],
+            ),
+            handler=display_media,
         ),
         Tool(
             name="reduce_video_frames",

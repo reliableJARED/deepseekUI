@@ -229,10 +229,13 @@ export function describeBlock(block) {
 /* ── element construction ──────────────────────────────────────────────── */
 
 function mediaCaption(block) {
-  const label = block.name || (block.type === 'video' ? 'video' : 'image');
+  // `caption` is what the tool said it was showing ('the monkey you asked for'), so it
+  // beats the filename as the visible label; the filename stays in the title text.
+  const label = block.caption || block.name || (block.type === 'video' ? 'video' : 'image');
   const detail = [extOf(block.mime, block.name)];
   if (block.width && block.height) detail.push(`${block.width}×${block.height}`);
-  return `<div class="media-cap"><span title="${escapeHtml(describeBlock(block))}">${escapeHtml(label)}</span>`
+  const title = [describeBlock(block), block.caption].filter(Boolean).join(' · ');
+  return `<div class="media-cap"><span title="${escapeHtml(title)}">${escapeHtml(label)}</span>`
     + `<span class="spacer"></span><a href="${escapeHtml(block.url)}" download title="Download">▼</a>`
     + `<span>${escapeHtml(detail.join(' · '))}</span></div>`;
 }

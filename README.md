@@ -59,7 +59,7 @@ run.py                    argument parsing and the loopback gate
 server/routes.py          HTTP surface; Starlette routes, no decorators
 server/app.py             wiring: settings -> store -> media -> engine -> app
 server/llm.py             the turn: compose, rehydrate, stream, run tools, persist
-server/tools_builtin.py   resize / compress / inspect / frame-reduce / read (six tools)
+server/tools_builtin.py   resize / compress / inspect / frame-reduce / read / show (seven tools)
 server/mcp.py             MCP servers over Streamable HTTP
 server/rehydrate.py       put stored media and text back into the request, under a budget
 server/media.py           sniffing, probing, resizing, frame extraction, text detection
@@ -133,6 +133,7 @@ See `.env.example` for the annotated list. The important ones:
 | `HOST` / `PORT` | `127.0.0.1` / `5000` | where to listen |
 | `ALLOW_LAN` | `false` | must be `true` *and* `--lan` to bind off-loopback |
 | `MEDIA_ROOT` | `./memory` | where conversations are written |
+| `MEDIA_DISPLAY_ROOTS` | — | extra directories `display_media` may read from (`;`-separated) |
 | `MCP_CONFIG` | `./mcp.json` | MCP server list; seeded from `mcp.example.json` on a first run |
 | `MODEL_TEXT_MAX_CHARS` | `40000` | how much of one attached text file is inlined |
 | `TEXT_CHAR_BUDGET` | `200000` | total attached text per request, newest first |
@@ -296,7 +297,12 @@ It exposes two tools:
 
 * **`web_search(query)`** — one grounded Gemini call. Gemini runs the search, reads the pages
   and writes the summary; the source URLs it was grounded on come back underneath, so the
-  answer can be checked and any one of them can be opened with `web_fetch`.
+  answer can be checked and any one of them can be opened with `web_fetch`. Those URLs arrive
+  from Gemini wrapped in an opaque Google redirect
+  (`vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQ…`), which names Google rather
+  than the publisher and carries a signature that expires. The server follows each one before
+  it answers and reports the publisher's own URL instead, so what reaches the model is the
+  address a browser would land on.
 * **`web_fetch(url)`** — opens a single page and returns its readable text plus content images.
   It needs no search, so it is the right tool whenever you already have an address. A bare
   domain such as `example.com` is accepted and assumed to be `https`. There is **no model in
@@ -432,7 +438,7 @@ body at once — depends on that.)
 
 ## Tools
 
-Six built-in tools shape media and files before they reach the model:
+Seven built-in tools shape media and files before they reach the model:
 
 | Tool | Why it exists |
 | --- | --- |
@@ -442,6 +448,7 @@ Six built-in tools shape media and files before they reach the model:
 | `reduce_video_frames` | sample a clip down to a handful of stills |
 | `compress_video` | re-encode a clip smaller, as H.264 when `ffmpeg` is on `PATH` |
 | `read_file` | page through an attached text file by line (`offset`, `limit`) |
+| `display_media` | show the *user* a file on disk; the model is told where it is instead |
 
 These are not conveniences. DeepSeek resizes every image to roughly 1300x1300 px and charges
 up to 1024 tokens for it, and it **upscales** anything smaller than ~544 px — so a 200 px
@@ -453,12 +460,65 @@ The practical consequence is that resizing before upload is not tidiness, it is 
 between a usable transcript and one that burns its context window on a single screenshot.
 
 Every tool path argument is resolved inside the active conversation and cannot escape it —
-neither by traversal nor by referencing another conversation's media.
+neither by traversal nor by referencing another conversation's media. The one exception is
+`display_media`, which exists precisely to reach a file a tool put *outside* the conversation;
+see [Showing media to the user](#showing-media-to-the-user).
 
 Two of these depend on binaries that may not be installed. Without `opencv-python` the video
 tools report that they cannot decode rather than raising, and without `ffmpeg` on `PATH`
 `compress_video` still works but produces `mp4v`, which browsers will not play. Everything else
 is pure Python.
+
+---
+
+## Showing media to the user
+
+The tools above are for getting media *into* the model. This is the other direction.
+
+When a tool hands back a picture, a clip or a sound — `web_fetch` downloads a page image into
+`mcp_server/web_media/`, an MCP server returns one inline, `display_media` is pointed at a file
+— it is not shown in the transcript, and it is not attached to the request either. It is
+**cut out** of the tool result and hung on the assistant turn the user reads to, rendered above
+the reply:
+
+```
+[tool message]   text: "1 image was shown to the user… its path is /memory/<uuid>/shown_image_….png
+                        — pass that path to inspect_media to look at it."
+[assistant turn] _display: [{type: image, url: /memory/<uuid>/shown_image_….png, caption: …}]
+[assistant turn] content:  "Here is the monkey you asked for."
+```
+
+This is deliberate, and it is worth being explicit about why, because the obvious design — leave
+the media in the tool result and let the tool card expand — is the one that was rejected:
+
+- **The user sees it without expanding anything.** The media is part of the reply, not a
+  collapsed detail of how the reply was produced.
+- **The model does not pay for it twice.** A tool result lives in the transcript forever, so
+  anything left in it is re-sent on every later request and charged for again. What stays behind
+  is one line of text naming the path.
+- **The model can still look, on purpose.** The note it gets names the path, and `inspect_media`
+  (or `read_file`) accepts it. Vision is opt-in per image rather than a standing cost.
+- **The file outlives the tool.** Bytes are copied into the conversation's own directory on the
+  way through, so a tool that later clears its download directory — which `web_fetch` does — cannot
+  rot a transcript.
+
+Every image, video or audio block an **MCP** server returns is treated this way automatically:
+an MCP tool's output is aimed at a person, and the server has no way to know better. A block the
+model asked for itself (a `resize_image` result it is meant to look at) is not marked, and goes
+upstream as it always did. The marker never reaches the API: it rides on the message as
+`_display` and on the block as `display: true`, and both are stripped on the way out.
+
+`display_media` is the case where the model names a file itself. It is the one built-in tool that
+reads outside the conversation, and only from:
+
+- the project directory (the agent can show you a file it is working on), and
+- anything listed in `MEDIA_DISPLAY_ROOTS`.
+
+The media directory itself is always refused, even when it is named as a root, because it holds
+every conversation's files at once — those are referred to by their `/memory/<uuid>/…` URL, which
+is already in scope for the conversation that owns them. Nothing outside those roots is
+reachable, so this is not a general read primitive: it copies bytes into the active conversation,
+it can only produce image/video/audio, and it never feeds a request.
 
 ---
 

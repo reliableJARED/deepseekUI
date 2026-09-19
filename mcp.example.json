@@ -41,23 +41,6 @@
 
   "servers": [
     {
-      "name": "filesystem",
-      "url": "http://127.0.0.1:8931/mcp",
-      "enabled": true,
-      "prefix": "fs",
-      "timeout": 120
-    },
-    {
-      "name": "example-with-auth",
-      "url": "https://mcp.example.com/mcp",
-      "headers": {
-        "Authorization": "Bearer ${MY_MCP_TOKEN}"
-      },
-      "enabled": false,
-      "allowedTools": ["search", "fetch_page"],
-      "prefix": "ex"
-    },
-    {
       "name": "self-reflection",
       "url": "http://127.0.0.1:8590/mcp",
       "enabled": false,
