@@ -602,8 +602,10 @@ def build_media_tools(
                     info["note"] = (
                         info.get("note", "")
                         + (" " if info.get("note") else "")
-                        + "That is the cost of sampling it into frames for you. Showing it "
-                        "to the user with display_media costs no tokens at all."
+                        + "That is the cost of sampling it into frames for you, which does "
+                        "not show the video to the user. To let them watch it, pass this "
+                        "same URL to display_media: that costs no tokens and they get a "
+                        "player."
                     ).strip()
             info["remote"] = True
             return ToolResult(content=json.dumps(info, indent=2), meta=info)
@@ -1052,15 +1054,25 @@ def build_media_tools(
                 "your reply in the user's interface — and only there: the media is not "
                 "attached to this request, so calling this does not let you see the file. "
                 "Use it to hand over a result the user asked to see: a page image "
-                "web_fetch downloaded, a render, a recording. The path may be a file in "
-                "this conversation or any media file in the project directory. If you "
-                "need to see media yourself, use resize_image or reduce_video_frames, "
-                "which do return it to you."
+                "web_fetch downloaded, a render, a recording.\n"
+                "An https:// URL works as well as a file, and this is how you answer "
+                "'show me this video' or a link the user pasted: a YouTube or Vimeo link "
+                "and any other image or video on the web are all accepted, and the user "
+                "gets a player above your reply that plays the original. Pass the URL "
+                "itself as `path`. Nothing is downloaded — the player streams the "
+                "original from the host's own servers, and only a preview frame lands "
+                "here — so it costs one call, no tokens, and the user watches the video "
+                "without leaving the conversation. Do this rather than pasting the "
+                "link: a bare URL in your reply is something they have to go elsewhere "
+                "to use.\n"
+                "The path may instead be a file in this conversation or any media file "
+                "in the project directory. If you need to see media yourself, use "
+                "resize_image or reduce_video_frames, which do return it to you."
             ),
             parameters=tool_schema(
                 "display_media",
                 properties={
-                    "path": {"type": "string", "description": "File to show: a /memory/ URL, a filename in this conversation, or a path inside the project directory."},
+                    "path": {"type": "string", "description": "What to show: a YouTube, Vimeo or other https:// URL, a /memory/ URL, a filename in this conversation, or a path inside the project directory."},
                     "caption": {"type": "string", "description": "Optional short caption shown with the media.", "default": ""},
                 },
                 required=["path"],
@@ -1077,7 +1089,11 @@ def build_media_tools(
                 "https:// links work, including YouTube and Vimeo. Where the stream cannot be "
                 "downloaded, this returns the video's metadata plus the stills that host "
                 "publishes, and says so; YouTube's are at roughly 1/8, 3/8, 5/8 and 7/8 of "
-                "the runtime. It never fetches the stream, so expect no audio or dialogue."
+                "the runtime. It never fetches the stream, so expect no audio or dialogue.\n"
+                "Frames come back to *you*, not to the user — this does not show them "
+                "anything. When the user asked to be shown a video, call display_media "
+                "with the URL instead; it hands them a player. This tool is for reading "
+                "a video's content yourself."
             ),
             parameters=tool_schema(
                 "reduce_video_frames",

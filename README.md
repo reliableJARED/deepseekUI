@@ -449,10 +449,10 @@ Seven built-in tools shape media and files before they reach the model:
 | `inspect_media` | reports dimensions, duration and estimated token cost, or a text file's lines and charset |
 | `resize_image` | downscale before upload |
 | `compress_image` | re-encode at lower quality |
-| `reduce_video_frames` | sample a clip down to a handful of stills |
+| `reduce_video_frames` | sample a clip down to a handful of stills for the *model* to look at |
 | `compress_video` | re-encode a clip smaller, as H.264 when `ffmpeg` is on `PATH` |
 | `read_file` | page through an attached text file by line (`offset`, `limit`) |
-| `display_media` | show the *user* a file on disk; the model is told where it is instead |
+| `display_media` | show the *user* a file or an `https://` URL — a YouTube/Vimeo link becomes a player |
 
 These are not conveniences. DeepSeek resizes every image to roughly 1300x1300 px and charges
 up to 1024 tokens for it, and it **upscales** anything smaller than ~544 px — so a 200 px
@@ -516,7 +516,9 @@ upstream as it always did. The marker never reaches the API: it rides on the mes
 reads outside the conversation, and only from:
 
 - the project directory (the agent can show you a file it is working on), and
-- anything listed in `MEDIA_DISPLAY_ROOTS`.
+- anything listed in `MEDIA_DISPLAY_ROOTS`,
+
+or an `https://…` URL, which is probed rather than read; see [Remote URLs](#remote-urls).
 
 The media directory itself is always refused, even when it is named as a root, because it holds
 every conversation's files at once — those are referred to by their `/memory/<uuid>/…` URL, which

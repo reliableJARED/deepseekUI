@@ -132,8 +132,10 @@ TOOLS = [
             "This tool returns text only, and it does not run JavaScript: on a page "
             "whose content is rendered by a script — a video player, most social feeds — "
             "little survives the prune and the title may be all you get. It cannot see "
-            "inside a video either. For a YouTube, Vimeo or other video URL use "
-            "reduce_video_frames; to show the user a URL's image, use display_media. "
+            "inside a video either. For a YouTube, Vimeo or other video URL, use "
+            "display_media when the user asked to be shown the video — it gives them a "
+            "player — or reduce_video_frames when you need to watch the video's frames "
+            "yourself; to show the user a URL's image, use display_media. "
             "Images come back only when a parsed HTML page references them, so fetching "
 "an image URL directly returns bytes rather than a picture."
         ),
