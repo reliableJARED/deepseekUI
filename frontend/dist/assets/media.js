@@ -226,17 +226,58 @@ function normalise(items) {
   return out;
 }
 
+/* Lowercase extensions, for deciding rather than for display: `extOf` returns the
+   caption's `MP4`/`JPG`, and prefers the name over the mime, which is the wrong way
+   round for a question about the bytes. */
+const NAME_EXT = /\.([a-z0-9]{1,5})$/i;
+const AUDIO_EXT = /^(mp3|wav|m4a|aac|ogg|oga|opus|flac|weba)$/;
+const VIDEO_EXT = /^(mp4|m4v|webm|mov|mkv|avi|ogv)$/;
+const IMAGE_EXT = /^(png|jpe?g|gif|webp|avif|bmp|svg)$/;
+
+/** The lowercase extension of a file name, or `''`. */
+function nameExt(name) {
+  const match = NAME_EXT.exec(String(name || ''));
+  return match ? match[1].toLowerCase() : '';
+}
+
+/**
+ * Which element a block wants, so that "what is this" is asked once.
+ *
+ * The declared `type` normally settles it and is not worth second-guessing. But a
+ * block that only says `file`, or says nothing at all, is not a reason to hand over a
+ * download chip for something the browser would have played — a URL with no suffix, a
+ * still a tool published under a bare name. So the mime is consulted next and the file
+ * name after it: a content type is a statement about the bytes, a `.mp4` is a hint.
+ */
+export function presentationFor(block) {
+  if (!block) return 'file';
+  const type = String(block.type || '');
+  if (type === 'embed' || type === 'image' || type === 'video' || type === 'audio') return type;
+
+  const mime = String(block.mime || '');
+  if (isImageMime(mime)) return 'image';
+  if (isVideoMime(mime)) return 'video';
+  if (mime.startsWith('audio/')) return 'audio';
+
+  const ext = nameExt(block.name);
+  if (IMAGE_EXT.test(ext)) return 'image';
+  if (VIDEO_EXT.test(ext)) return 'video';
+  if (AUDIO_EXT.test(ext)) return 'audio';
+  return 'file';
+}
+
 /** True when a block is an image or video the user should see rendered. */
 export function isMediaBlock(block) {
   if (!block) return false;
+  const kind = presentationFor(block);
   // An embed is media the user sees, just not media we hold: the player is a frame
   // from someone else's origin, so the block is a page URL plus an iframe URL. The
   // iframe URL is what makes it playable — a page URL with no player behind it falls
   // through to the file chip, which at least links somewhere.
-  if (block.type === 'embed') return Boolean(block.embed_url || block.embedUrl);
-  return (block.type === 'image' && block.url)
-    || (block.type === 'video' && block.url)
-    || (block.type === 'audio' && block.url);
+  if (kind === 'embed') return Boolean(block.embed_url || block.embedUrl);
+  if (kind !== 'image' && kind !== 'video' && kind !== 'audio') return false;
+  // `stream` counts as much as `url` for a player; `url` is what the caption links to.
+  return Boolean(block.url || block.stream);
 }
 
 /** True when a block is an embed we should draw a play affordance for. */
@@ -270,11 +311,14 @@ export function describeBlock(block) {
 function mediaCaption(block) {
   // `caption` is what the tool said it was showing ('the monkey you asked for'), so it
   // beats the filename as the visible label; the filename stays in the title text.
+  // The fallback label is the *rendered* kind, not `block.type`, so a block that only
+  // declared itself a `file` is not captioned as an image it is not.
+  const kind = presentationFor(block);
   const remote = block.source === 'remote';
   const label = block.caption || block.title || block.name
-    || (block.type === 'video' ? 'video' : block.type === 'embed' ? 'video' : 'image');
+    || (kind === 'video' || kind === 'embed' ? 'video' : kind === 'audio' ? 'audio' : 'image');
   const detail = [];
-  if (block.type !== 'embed') detail.push(extOf(block.mime, block.name));
+  if (kind !== 'embed') detail.push(extOf(block.mime, block.name));
   if (block.width && block.height) detail.push(`${block.width}×${block.height}`);
   const duration = durationText(block.duration);
   if (duration) detail.push(duration);
@@ -340,13 +384,46 @@ function embedElement(block) {
 }
 
 /**
+ * A codec the browser will not take is not an error the user can act on, and a dead
+ * `<video>` is a black rectangle with controls and no explanation. Swapping in the same
+ * chip the unknown-type path draws says what the file is and offers the bytes, which is
+ * also what a format the machine cannot play deserves.
+ */
+function fallbackToChip(figure, media, block) {
+  if (!media) return;
+  media.addEventListener('error', () => {
+    figure.classList.add('broken');
+    figure.replaceChildren(fileChip(block));
+  });
+}
+
+/** The last resort: the name we have for the bytes, as a link if there is somewhere to link to. */
+function fileChip(block) {
+  const chip = document.createElement('span');
+  chip.className = 'file-chip';
+  const name = block.name || extOf(block.mime);
+  chip.innerHTML = block.url
+    ? `<svg viewBox="0 0 24 24"><path d="M14 3v5h5M6 3h8l5 5v13H6z"/></svg><a href="${escapeHtml(block.url)}" download>${escapeHtml(name)}</a>`
+    : `<svg viewBox="0 0 24 24"><path d="M14 3v5h5M6 3h8l5 5v13H6z"/></svg>${escapeHtml(name)}`;
+  return chip;
+}
+
+/**
  * Build the element for one media block.
  * `onZoom(url)` is called when an image is clicked.
+ *
+ * Which element that is comes from `presentationFor`, which reads the mime and the
+ * file name as well as the type — so a block that arrived without a usable type still
+ * gets a player rather than a chip.
  */
 export function elementForBlock(block, { onZoom = null } = {}) {
-  if (block.type === 'code') return codeChip(block);
+  // First, before `presentationFor` is asked anything: a code block is not media and
+  // has no mime or name to infer from, and a chip of source is what it wants.
+  if (block && block.type === 'code') return codeChip(block);
 
-  if (block.type === 'image' && block.url) {
+  const kind = presentationFor(block);
+
+  if (kind === 'image' && block.url) {
     const figure = document.createElement('figure');
     figure.className = 'media-item';
     figure.innerHTML =
@@ -355,8 +432,9 @@ export function elementForBlock(block, { onZoom = null } = {}) {
       + `${block.height ? ` height="${Number(block.height)}"` : ''}>`
       + mediaCaption(block);
     const img = figure.querySelector('img');
-    // A /memory/ URL can 404 if the file was deleted by hand; say so rather than
-    // leaving a broken-image glyph in the transcript.
+    // A /memory/ URL can 404 if the file was deleted by hand, and a format the browser
+    // cannot decode is not a picture either; say so rather than leaving a broken-image
+    // glyph in the transcript.
     img.addEventListener('error', () => {
       figure.classList.add('broken');
       img.replaceWith(Object.assign(document.createElement('span'), {
@@ -368,7 +446,7 @@ export function elementForBlock(block, { onZoom = null } = {}) {
     return figure;
   }
 
-  if (block.type === 'video' && (block.url || block.stream)) {
+  if (kind === 'video' && (block.url || block.stream)) {
     // `stream` first: a proxy URL exists exactly when the browser could not be
     // pointed at the original. `url` stays the identity of the media — the caption,
     // the download link and the note the model was given all use it.
@@ -380,27 +458,156 @@ export function elementForBlock(block, { onZoom = null } = {}) {
       + `${block.poster ? ` poster="${escapeHtml(block.poster)}"` : ''}`
       + `${block.width ? ` width="${Number(block.width)}"` : ''}></video>`
       + mediaCaption(block);
+    fallbackToChip(figure, figure.querySelector('video'), block);
     return figure;
   }
 
-  if (block.type === 'embed') {
+  if (kind === 'embed') {
     return embedElement(block);
   }
 
-  if (block.type === 'audio' && block.url) {
+  if (kind === 'audio' && block.url) {
     const figure = document.createElement('figure');
     figure.className = 'media-item';
     figure.innerHTML = `<audio src="${escapeHtml(block.url)}" controls></audio>` + mediaCaption(block);
+    fallbackToChip(figure, figure.querySelector('audio'), block);
     return figure;
   }
 
-  const chip = document.createElement('span');
-  chip.className = 'file-chip';
-  const name = block.name || extOf(block.mime);
-  chip.innerHTML = block.url
-    ? `<svg viewBox="0 0 24 24"><path d="M14 3v5h5M6 3h8l5 5v13H6z"/></svg><a href="${escapeHtml(block.url)}" download>${escapeHtml(name)}</a>`
-    : `<svg viewBox="0 0 24 24"><path d="M14 3v5h5M6 3h8l5 5v13H6z"/></svg>${escapeHtml(name)}`;
-  return chip;
+  return fileChip(block);
+}
+
+/* ── the row: one item, or a carousel of several ───────────────────────── */
+
+/**
+ * A horizontal track of media with prev/next arrows and dots.
+ *
+ * Several things to look at used to wrap onto as many rows as they needed, which for
+ * four videos is four screens of scrolling; a carousel is one row whatever it holds.
+ * It is a plain `media-grid` for a single item — the arrows would have nowhere to go,
+ * and one image should not have to look interactive.
+ *
+ * What each item *is* stays `elementForBlock`'s business: an image, a player, a poster
+ * or a chip. Nothing here decides that, so a new kind of media joins the carousel by
+ * being one more element.
+ *
+ * Stepping is `scrollTo` on the track rather than a re-layout, so the arrows, a
+ * trackpad, a wheel and a thumb swipe all move the same element, and the arrows are
+ * computed from where the track actually is (`scrollLeft`) rather than from a counter
+ * that a smooth scroll can leave out of step.
+ */
+export function mediaRow(blocks, { onZoom = null } = {}) {
+  const items = [];
+  for (const block of blocks) {
+    if (!isMediaBlock(block)) continue;
+    const element = elementForBlock(block, { onZoom });
+    if (element) items.push(element);
+  }
+
+  const root = document.createElement('div');
+  root.className = 'media-grid';
+  if (!items.length) return null;
+  if (items.length === 1) {
+    root.append(items[0]);
+    return root;
+  }
+
+  root.classList.add('carousel');
+  const track = document.createElement('div');
+  track.className = 'car-track';
+  track.append(...items);
+
+  const count = document.createElement('span');
+  count.className = 'car-count';
+  const dots = document.createElement('div');
+  dots.className = 'car-dots';
+  const foot = document.createElement('div');
+  foot.className = 'car-foot';
+  foot.append(count, dots);
+
+  const nav = [];
+  for (const [direction, label] of [[-1, 'Previous'], [1, 'Next']]) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = direction < 0 ? 'car-nav prev' : 'car-nav next';
+    button.title = label;
+    button.setAttribute('aria-label', label);
+    button.innerHTML =
+      '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="'
+      + (direction < 0 ? 'M14.5 5.5L8 12l6.5 6.5' : 'M9.5 5.5L16 12l-6.5 6.5')
+      + '"/></svg>';
+    nav.push(button);
+  }
+
+  root.append(track, nav[0], nav[1], foot);
+
+  let at = 0;
+  let fits = false;
+  const goTo = (index) => {
+    const item = items[Math.max(0, Math.min(items.length - 1, index))];
+    // Measured against the track, not the page: both rects change with the scroll.
+    if (item) track.scrollTo({ left: item.offsetLeft - track.offsetLeft, behavior: 'smooth' });
+  };
+
+  let frame = 0;
+  // A disabled arrow is also what the stylesheet hides, so the two agree on the day
+  // one of them is looked at without the other.
+  const step = () => {
+    nav[0].disabled = fits || at <= 0;
+    nav[1].disabled = fits || at >= items.length - 1;
+  };
+  const sync = () => {
+    const max = track.scrollWidth - track.clientWidth;
+    let nearest = Infinity;
+    items.forEach((item, index) => {
+      const distance = Math.abs(item.offsetLeft - track.offsetLeft - track.scrollLeft);
+      if (distance < nearest) { nearest = distance; at = index; }
+    });
+    // The end of the track is the one place "nearest item start" cannot reach: the
+    // last item's left edge never arrives at the track's left edge, because the
+    // scroll stops first. Two 460px items in the transcript's 790px leave the second
+    // one 142px short, so the nearest start would still be the first item's — the
+    // counter would stall at "1 / 2" with Next lit and nothing left for it to do.
+    // A scroll that is as far right as it goes means the last item, whatever the
+    // pixels say. (`max <= 2` is a row that fits, where the last item is not current.)
+    if (max > 2 && max - track.scrollLeft <= 2) at = items.length - 1;
+    // A detached element measures 0, which must not read as "all of it fits".
+    fits = track.clientWidth > 0 && max <= 2;
+    root.classList.toggle('fits', fits);
+    count.textContent = `${at + 1} / ${items.length}`;
+    dots.replaceChildren(...items.map((_, index) => {
+      const dot = document.createElement('button');
+      dot.type = 'button';
+      dot.className = index === at ? 'car-dot on' : 'car-dot';
+      dot.title = `Show item ${index + 1} of ${items.length}`;
+      dot.setAttribute('aria-label', dot.title);
+      dot.addEventListener('click', () => goTo(index));
+      return dot;
+    }));
+    step();
+  };
+
+  const schedule = () => {
+    if (frame) return;
+    // A timer in a hidden tab and a frame in a visible one: `requestAnimationFrame`
+    // never fires while the tab is in the background, so a transcript re-rendered
+    // there would keep a carousel with no counter, no dots and arrows that have not
+    // been disabled yet, and nothing would correct it until something scrolled.
+    if (document.hidden) frame = setTimeout(() => { frame = 0; sync(); }, 0);
+    else frame = requestAnimationFrame(() => { frame = 0; sync(); });
+  };
+
+  nav[0].addEventListener('click', () => { goTo(at - 1); step(); });
+  nav[1].addEventListener('click', () => { goTo(at + 1); step(); });
+  track.addEventListener('scroll', schedule, { passive: true });
+  // An image that finishes loading after the row was built changes the track's width,
+  // which is what decides whether the arrows are needed at all. A listener on the row
+  // rather than on `window`, because the transcript is re-rendered every turn and a
+  // global one would outlive every carousel it was added for.
+  root.addEventListener('load', schedule, true);
+  root.addEventListener('error', schedule, true);
+  schedule();
+  return root;
 }
 
 /* ── code ──────────────────────────────────────────────────────────────── */

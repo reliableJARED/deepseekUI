@@ -17,7 +17,7 @@
 import { api, ApiError, streamChat } from './api.js';
 import { markdown, toPlainText, escapeHtml } from './markdown.js';
 import {
-  blocksOf, isMediaBlock, elementForBlock, kindForFile, uiKindForFile, formatBytes, extOf,
+  blocksOf, isMediaBlock, elementForBlock, mediaRow, kindForFile, uiKindForFile, formatBytes, extOf,
   readFileListing, copyText as copyToClipboard, revokePreview,
 } from './media.js';
 import { detectLanguage, languageForName, languageLabel } from './highlight.js';
@@ -131,11 +131,9 @@ function proseElement(text) {
 }
 
 function mediaGrid(blocks) {
-  const grid = h('div', 'media-grid');
-  for (const block of blocks) {
-    if (isMediaBlock(block)) grid.append(elementForBlock(block, { onZoom: openLightbox }));
-  }
-  return grid.children.length ? grid : null;
+  // One item is a grid, several are a carousel — see `mediaRow`. Which is the only
+  // thing that varies: the elements themselves are built the same way either side.
+  return mediaRow(blocks, { onZoom: openLightbox });
 }
 
 /**
@@ -560,7 +558,7 @@ function createTurnPainter() {
   // because the disk re-render at the end of the turn puts it there — and a turn that
   // jumped around while it ran would be worse than no live paint at all.
   const shownRow = h('div', 'media-grid shown-media');
-  let shownCount = 0;
+  const shownBlocks = [];
   let streamText = '';
   const events = h('div');
   const cards = new Map();
@@ -680,11 +678,20 @@ function createTurnPainter() {
         // Prepended, not appended: the transcript re-render at the end of the turn
         // builds media-before-cards-before-text from disk, and the live paint should
         // not visibly reshuffle when that happens.
-        if (!shownCount) events.prepend(shownRow);
-        for (const block of media) {
-          if (isMediaBlock(block)) shownRow.append(elementForBlock(block, { onZoom: openLightbox }));
+        shownBlocks.push(...media.filter(isMediaBlock));
+        // Rebuilt rather than appended to, because the row has to become a carousel
+        // the moment it holds a second item and there is no way to grow one in place.
+        // Every media block a tool returns arrives in the same batch, so this is one
+        // rebuild per tool call, and the end-of-turn re-render replaces it anyway.
+        const row = mediaRow(shownBlocks, { onZoom: openLightbox });
+        if (row) {
+          if (!shownRow.isConnected) events.prepend(shownRow);
+          // `row.className` is a replacement, so the class that marks this row as tool
+          // media rather than something the reply said has to be put back.
+          shownRow.className = `${row.className} shown-media`;
+          // A snapshot of the children, because moving them mutates the live list.
+          shownRow.replaceChildren(...row.children);
         }
-        shownCount += media.length;
       }
       scrollToBottom();
     },

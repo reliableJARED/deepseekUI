@@ -653,6 +653,77 @@ code, pre, .mono { font-family: var(--mono); font-size: .87em; }
   border-left: 2px solid var(--line-soft);
 }
 
+/* ── carousel (more than one thing to look at) ─────────────────────────────
+   Several media blocks go on a horizontal track instead of wrapping onto another
+   row each: four videos stacked is four screens of scrolling and a row is one.
+   `media.js` decides when — one item stays a plain `.media-grid`, so a single
+   image does not have to look interactive. Items keep whatever size and shape
+   their own rules give them; this only decides how they are scrolled.
+
+   `.fits` means the whole row already fits on screen: at that point the arrows and
+   the counter are describing a scroll that cannot happen, so they are removed. */
+.media-grid.carousel { display: block; position: relative; }
+.car-track {
+  display: flex; align-items: flex-start; gap: 8px;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scroll-snap-type: x mandatory;
+  scroll-behavior: smooth;
+  scrollbar-width: thin;
+  padding-bottom: 2px;
+}
+.car-track > * { flex: 0 0 auto; scroll-snap-align: start; margin: 0; }
+/* `margin: 0` above is not cosmetic: `figure` carries a 40px user-agent side margin, so
+   a slide would start 40px into the track. The arrows scroll by measuring an item's
+   offset against the track, and a scroll position that is not the item's own edge is a
+   position the snap points then argue with. Slides are spaced by `gap` alone. */
+/* A slide may be bigger than a grid thumbnail — the point is one thing at a time —
+   but never wider than the transcript, which `min()` enforces without a second
+   query: on a narrow screen 100% is already less than 460px. */
+.media-grid.carousel .media-item:not(.media-embed) { max-width: min(100%, 460px); }
+.media-grid.carousel .media-item:not(.media-embed) img,
+.media-grid.carousel .media-item:not(.media-embed) video {
+  max-width: 100%; max-height: 320px;
+}
+.car-nav {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  z-index: 2;
+  display: grid; place-items: center;
+  width: 28px; height: 28px; padding: 0;
+  border: 1px solid var(--line); border-radius: 50%;
+  background: var(--bg);
+  /* A slide can be a bright screenshot, so the button is mostly opaque rather than a
+     flat circle punched out of the picture. The solid `background` above is what an
+     engine without `color-mix` falls back to. */
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  color: var(--fg-mid);
+  cursor: pointer;
+}
+.car-nav:hover { color: var(--fg); border-color: var(--accent-line); }
+.car-nav:disabled { opacity: .3; cursor: default; }
+.car-nav svg {
+  width: 15px; height: 15px;
+  fill: none; stroke: currentColor; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.car-nav.prev { left: 6px; }
+.car-nav.next { right: 6px; }
+.car-foot {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 2px 0;
+  font-size: 10.6px; color: var(--fg-faint);
+}
+.car-dots { display: flex; align-items: center; gap: 5px; }
+.car-dot {
+  width: 6px; height: 6px; padding: 0;
+  border: 0; border-radius: 50%;
+  background: var(--line);
+  cursor: pointer;
+}
+.car-dot.on { background: var(--accent); }
+.media-grid.carousel.fits .car-nav,
+.media-grid.carousel.fits .car-foot { display: none; }
+
 .file-chip {
   display: inline-flex; align-items: center; gap: 7px;
   margin: 6px 6px 0 0;

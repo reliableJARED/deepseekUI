@@ -473,12 +473,23 @@ def build_media_tools(
             )
 
         dim = max_dim if max_dim and int(max_dim) > 0 else _remote_limits(settings).frame_max_dim
-        effective = manifest.duration and len(blocks) / manifest.duration
-        rate = f"~{effective:.2f} fps" if effective else f"{len(blocks)} samples"
-        header = (
-            f"{_remote_label(manifest)} — streamed from {url}, not downloaded.\n"
-            f"Sampled {len(blocks)} frames at {rate}, longest edge {dim} px."
-        )
+        if manifest.frames_origin == "published_stills":
+            # No rate and no longest edge: neither number describes anything that
+            # happened. Nobody sampled this video, so a fake fps here would be a
+            # claim about how the pictures were spaced that nothing supports.
+            plural = "" if len(blocks) == 1 else "s"
+            header = (
+                f"{_remote_label(manifest)} — streamed from {url}, not downloaded.\n"
+                f"{len(blocks)} still{plural} published by the host; the video stream "
+                "was not read."
+            )
+        else:
+            effective = manifest.duration and len(blocks) / manifest.duration
+            rate = f"~{effective:.2f} fps" if effective else f"{len(blocks)} samples"
+            header = (
+                f"{_remote_label(manifest)} — streamed from {url}, not downloaded.\n"
+                f"Sampled {len(blocks)} frames at {rate}, longest edge {dim} px."
+            )
         if manifest.note:
             header += f"\n{manifest.note}"
         header += f"\nEstimated cost: ~{len(blocks) * 1024} tokens for the frames."
@@ -1087,9 +1098,11 @@ def build_media_tools(
                 "lower target_fps or max_frames for long clips. Use this instead of guessing "
                 "what a video contains, and use it — not web_fetch — for any video URL: "
                 "https:// links work, including YouTube and Vimeo. Where the stream cannot be "
-                "downloaded, this returns the video's metadata plus the stills that host "
-                "publishes, and says so; YouTube's are at roughly 1/8, 3/8, 5/8 and 7/8 of "
-                "the runtime. It never fetches the stream, so expect no audio or dialogue.\n"
+                "read, this returns the video's metadata plus whatever stills the host "
+                "publishes, and the result says which it got — how many frames were decoded "
+                "from the video, and how many are the host's own stills at points the host "
+                "does not document. Read that line before reasoning about timing. No audio "
+                "or dialogue is ever available.\n"
                 "Frames come back to *you*, not to the user — this does not show them "
                 "anything. When the user asked to be shown a video, call display_media "
                 "with the URL instead; it hands them a player. This tool is for reading "

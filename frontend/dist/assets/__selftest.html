@@ -3,7 +3,14 @@
 <head>
 <meta charset="utf-8">
 <title>frontend self-test</title>
+<link rel="stylesheet" href="/assets/app.css">
 <style>
+  /* app.css is linked above because whether a row of media "fits" is a layout
+     measurement, and measuring it without the rules the row is laid out by proves
+     nothing. What this page cannot take from it is the app shell: `html, body` are
+     pinned to the viewport there with `overflow: hidden`, which would clip this
+     report to one screen. */
+  html, body { height: auto !important; overflow: visible !important; display: block !important; }
   body { background: #14161a; color: #d8dee9; font: 13px/1.5 monospace; margin: 0; padding: 16px; }
   pre#out { white-space: pre-wrap; }
   .ok { color: #7fd18a; }
@@ -28,7 +35,7 @@ import {
 } from '/assets/highlight.js';
 import {
   blocksOf, codeBlock, durationText, elementForBlock, isEmbedBlock, isMediaBlock,
-  readFileListing, uiKindForFile,
+  mediaRow, presentationFor, readFileListing, uiKindForFile,
 } from '/assets/media.js';
 import {
   API_KEY_HEADER, formatHeaders, parseHeaders, mcpApiKeyOf, mcpHeadersWithoutKey, withApiKey,
@@ -699,6 +706,181 @@ if (barePlay && !barePlay.disabled) fail('an embed with no frame URL is not disa
 if (barePlay) barePlay.dispatchEvent(new MouseEvent('click', { bubbles: true }));
 if (bare.querySelector('iframe')) fail('an embed without a frame URL built a player anyway');
 pass('an embed with no frame URL degrades instead of throwing');
+
+/* ── 10. the media row: one item, or a carousel of several ─────────────────
+   Several blocks have to become one scrollable track and a single block must not,
+   because an image with arrows under it invites a click that does nothing. The
+   arrows are also the part that can only be tested in a browser: whether a row
+   "fits" is a measurement (`scrollWidth` against `clientWidth`), so this section
+   needs real layout and real rAF ticks rather than a detached element. */
+
+// A block whose mime or name says what it is gets played even if its `type` does not:
+// a source with no extension in its URL, a name with no suffix, a still a tool
+// published under a bare name.
+const INFERRED = [
+  [{ type: 'file', url: '/memory/c1/x', mime: 'video/mp4' }, 'video'],
+  [{ url: '/memory/c1/x', name: 'holiday.MOV' }, 'video'],
+  [{ type: 'file', url: '/memory/c1/x', name: 'song.m4a' }, 'audio'],
+  [{ type: 'file', url: '/memory/c1/x', name: 'shot.webp' }, 'image'],
+  [{ type: 'file', url: '/memory/c1/x', name: 'notes.md' }, 'file'],
+  [{ type: 'image', url: '/memory/c1/x', mime: 'video/mp4' }, 'image'],
+];
+for (const [block, want] of INFERRED) {
+  const got = presentationFor(block);
+  if (got !== want) fail(`presentationFor(${block.name || block.mime}) = ${got}, wanted ${want}`);
+}
+if (!elementForBlock({ type: 'file', url: '/memory/c1/x', mime: 'video/mp4' }).querySelector('video')) {
+  fail('a video mislabelled as a file did not become a player');
+}
+if (!elementForBlock({ type: '_file', url: '/memory/c1/x', name: 'song.m4a' }).querySelector('audio')) {
+  fail('an audio file named .m4a did not become a player');
+}
+if (!elementForBlock({ type: '_file', url: '/memory/c1/x', name: 'notes.md' }).querySelector('a')) {
+  fail('a text file lost its chip');
+}
+if (!isMediaBlock({ type: 'file', url: '/memory/c1/x', mime: 'video/mp4' })) {
+  fail('a file-typed video does not count as media');
+}
+if (isMediaBlock({ type: 'file', url: '/memory/c1/x', name: 'notes.md' })) {
+  fail('a text file counts as media');
+}
+pass(`presentationFor over ${INFERRED.length} blocks, and what it renders as`);
+
+// A code block has no mime and usually no name, so nothing can be inferred about it and
+// the dispatch has to ask about it before it asks anything else.
+if (!elementForBlock({ type: 'code', lang: 'python', text: 'x = 1' }).classList.contains('code-chip')) {
+  fail('a code block stopped rendering as a code chip');
+}
+if (isMediaBlock({ type: 'code', lang: 'python', text: 'x = 1' })) {
+  fail('a code block counts as media');
+}
+
+const settle = (ms = 0) => new Promise((done) => { setTimeout(done, ms); });
+const until = async (check, tries = 40) => {
+  for (let i = 0; i < tries; i += 1) {
+    if (check()) return true;
+    await settle(50);
+  }
+  return check();
+};
+
+// A real one-pixel PNG, inline: the media a layout test needs has to actually load,
+// and a `/memory/` URL that 404s is *designed* to turn into a chip, which replaces the
+// very element the row is being asked about. `width`/`height` go on the `<img>`, so the
+// item measures the same before the bytes arrive as after — which is what a wide image
+// is for here: three of them cannot fit in 360px, and one of them cannot fill 1800px.
+const PIXEL = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP4z8DwHwAFAAH/VscvDQAAAABJRU5ErkJggg==';
+const shot = (name, width) => ({
+  type: 'image', url: PIXEL, mime: 'image/png', name, width, height: Math.round(width / 2),
+});
+
+// The other two are here on purpose and are both unreachable: a row has to survive a
+// block whose bytes are gone, and the arrow maths should not care what is inside an item.
+const ROW = [
+  shot('a.png', 400),
+  { type: 'audio', url: '/memory/c1/b.mp3', mime: 'audio/mpeg', name: 'b.mp3' },
+  { type: 'video', url: '/memory/c1/c.mp4', mime: 'video/mp4', name: 'c.mp4' },
+];
+
+const host = document.createElement('div');
+host.style.cssText = 'width:360px; position:relative;';
+document.body.append(host);
+
+const single = mediaRow([shot('one.png', 400)], {});
+host.append(single);
+await settle(30);
+if (single.className !== 'media-grid') fail(`a single item is not a plain grid: ${single.className}`);
+if (single.querySelector('.car-nav')) fail('a single item grew carousel arrows');
+if (!single.querySelector('img')) fail('a single image did not render');
+pass('one item stays a plain grid — no track, no arrows');
+
+// The row whose bytes are gone: an item has to survive as a player or a chip rather
+// than as an empty box, and the arrow maths must not care what sits inside an item.
+// Either a player or a chip, and an image is neither: what is being asserted is that
+// an item never renders as an empty box waiting for bytes that are not coming.
+const deadRow = mediaRow(ROW, {});
+host.append(deadRow);
+await until(() => deadRow.querySelector('.car-count')?.textContent !== '');
+const deadTrack = deadRow.querySelector('.car-track');
+if (!await until(() => [...(deadTrack?.children || [])].every((item) => item.querySelector('img, audio, video, .file-chip')))) {
+  fail('an item in the track is neither a player nor a chip');
+}
+pass('a track renders every item it is given, even with the bytes gone');
+
+// Three 400px images in a 360px host: every item's start edge is reachable, so each
+// step has one unambiguous answer. `ROW` cannot test stepping — its two chips are 98px
+// wide, which leaves the track 254px of travel, and the far end arrives on the first
+// click, where "which item is current" is a judgement call rather than a fact.
+const STEPS = [shot('s1.png', 400), shot('s2.png', 400), shot('s3.png', 400)];
+const row = mediaRow(STEPS, {});
+host.append(row);
+await until(() => row.querySelector('.car-count')?.textContent !== '');
+const track = row.querySelector('.car-track');
+if (!row.classList.contains('carousel')) fail('three items did not become a carousel');
+if (!track) fail('a carousel has no track');
+if (track && track.children.length !== 3) fail(`the track holds ${track.children.length} items, wanted 3`);
+if (track && !track.querySelector('img')) fail('the image did not render inside the track');
+if (row.querySelectorAll('.car-nav').length !== 2) fail(`the row has ${row.querySelectorAll('.car-nav').length} arrows, wanted 2`);
+if (row.querySelectorAll('.car-dot').length !== 3) fail('there is not one dot per item');
+if (row.classList.contains('fits')) fail('three 400px items cannot fit in 360px');
+const count = () => row.querySelector('.car-count').textContent;
+if (count() !== '1 / 3') fail(`the counter starts at ${count()}`);
+
+const prev = row.querySelector('.car-nav.prev');
+const next = row.querySelector('.car-nav.next');
+if (!prev.disabled) fail('the prev arrow is enabled at the first item');
+next.click();
+if (!await until(() => track.scrollLeft > 0)) fail('the next arrow did not move the track');
+// Polled rather than read once: the counter follows the scroll event, and the scroll is
+// smooth, so the two are a frame apart by construction.
+if (!await until(() => count() === '2 / 3')) fail(`after next the counter reads ${count()}`);
+if (prev.disabled) fail('the prev arrow stayed disabled after moving');
+if (next.disabled) fail('the next arrow disabled itself with an item still to go');
+prev.click();
+if (!await until(() => track.scrollLeft === 0 && count() === '1 / 3')) {
+  fail(`prev left the track at ${track.scrollLeft}, reading ${count()}`);
+}
+pass('three items scroll with the arrows, and the counter follows the track');
+
+// The arrows exist to describe a scroll that is possible. A row that fits says so,
+// and the CSS is what removes them — so this checks the class and what follows from it.
+const wide = document.createElement('div');
+wide.style.cssText = 'width:1800px;';
+document.body.append(wide);
+const fitsRow = mediaRow(ROW, {});
+wide.append(fitsRow);
+await until(() => fitsRow.querySelector('.car-count')?.textContent !== '');
+if (!fitsRow.classList.contains('fits')) fail('a row narrower than its container does not report that it fits');
+const arrow = fitsRow.querySelector('.car-nav');
+if (arrow && getComputedStyle(arrow).display !== 'none') fail('an arrow is drawn on a row that fits');
+const foot = fitsRow.querySelector('.car-foot');
+if (foot && getComputedStyle(foot).display !== 'none') fail('the counter is drawn on a row that fits');
+if (fitsRow.querySelector('.car-nav').disabled !== true) fail('an arrow on a row that fits is still clickable');
+pass('a row that already fits hides its arrows and its counter');
+
+// The end of a track is the one place a "nearest item start" rule cannot reach: the
+// last item's left edge never arrives at the track's left edge, because the scroll
+// stops first. Two 460px items in the transcript's own 790px leave the second 142px
+// short, and the page this was measured on had exactly that shape — the counter sat at
+// "1 / 2" with the Next arrow lit and nothing left for it to do.
+const near = document.createElement('div');
+near.style.cssText = 'width:790px;';
+document.body.append(near);
+const endRow = mediaRow([shot('end-a.png', 460), shot('end-b.png', 460)], {});
+near.append(endRow);
+await until(() => endRow.querySelector('.car-count')?.textContent !== '');
+const endCount = () => endRow.querySelector('.car-count').textContent;
+const endPrev = endRow.querySelector('.car-nav.prev');
+const endNext = endRow.querySelector('.car-nav.next');
+endNext.click();
+if (!await until(() => endCount() === '2 / 2')) fail(`at the end of the track the counter reads ${endCount()}`);
+if (!endNext.disabled) fail('the next arrow is still enabled with the last item showing');
+if (endPrev.disabled) fail('the prev arrow is disabled with the last item showing');
+endPrev.click();
+if (!await until(() => endCount() === '1 / 2' && endRow.querySelector('.car-track').scrollLeft === 0)) {
+  fail(`stepping back from the last item left the counter at ${endCount()}`);
+}
+pass('the last item is reachable even though its left edge cannot reach the track');
 
 /* ── report ──────────────────────────────────────────────────────────────── */
 

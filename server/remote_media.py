@@ -39,6 +39,7 @@ hand it to a worker thread (``asyncio.to_thread``), which is what the tools do.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -74,6 +75,9 @@ __all__ = [
     "forget",
     "is_remote_url",
     "TRANSPORT",
+    "Extractor",
+    "YtDlpExtractor",
+    "EXTRACTOR",
 ]
 
 #: One `resolve_remote` call has to finish inside its caller's own timeout, because
@@ -233,6 +237,16 @@ class RemoteLimits:
     #: would otherwise be pointed at on a developer's machine all day are this
     #: server itself and a local model daemon, and neither is a video.
     allow_private: bool = False
+    #: Resolve a real stream URL for an embed host (YouTube, Vimeo) so the video
+    #: itself can be sampled instead of the stills its host publishes. Off by
+    #: default: this is a decision about a provider's terms rather than a technical
+    #: one, and the tool that does it is a fast-moving dependency that installs
+    #: cookies, parses a moving web player, and breaks when either changes. Absence
+    #: of that tool is normal and is reported, never treated as a failure.
+    extract_embeds: bool = False
+    #: Wall-clock ceiling for one extraction attempt. Separate from `timeout`, which
+    #: covers one HTTP request; both are bounded by `total_timeout`.
+    extract_timeout: float = 30.0
     #: Wall-clock ceiling for one `resolve_remote` call, all steps included.
     total_timeout: float = DEFAULT_TOTAL_BUDGET
 
@@ -252,6 +266,8 @@ class RemoteLimits:
             frames_max=int(pick("remote_frames_max", cls.frames_max)),
             proxy=bool(pick("remote_media_proxy", cls.proxy)),
             allow_private=bool(pick("remote_media_allow_private", cls.allow_private)),
+            extract_embeds=bool(pick("remote_extract_embeds", cls.extract_embeds)),
+            extract_timeout=float(pick("remote_extract_timeout", cls.extract_timeout)),
             total_timeout=float(pick("remote_media_total_timeout", cls.total_timeout)),
         )
 
@@ -925,6 +941,135 @@ def _run(cmd: Sequence[str], timeout: float, *, what: str) -> subprocess.Complet
         raise RemoteMediaError(f"could not run {cmd[0]}: {exc}", kind="decode")
 
 
+class Extractor:
+    """Resolves a provider's video ID into a directly playable media URL.
+
+    This exists because an embed host serves a *player*, not a file: the URL in the
+    transcript is a page, so there is nothing for `ffmpeg` to seek in. An extractor
+    asks the provider's own player what the underlying stream is, and then the normal
+    seek-and-decode path can run against it.
+
+    The base class answers "no, and there is nothing here to run", which is also what
+    a machine without the tool installed gets. Subclasses override both methods.
+
+    Two rules bind every implementation, and they are why this is an interface rather
+    than a function call:
+
+    * **Nothing is downloaded.** The interface asks for a *URL*, and the one
+      implementation here passes ``--skip-download``. Bytes that reach the decoder
+      still travel through the analysis token, so they are still budgeted.
+    * **The answer is transient.** An extracted URL is session- and timestamp-bound
+      and stops working within hours. It must never be written into the transcript or
+      left in :func:`sources`; see :func:`_resolve_embed`, which samples it under an
+      analysis token only.
+    """
+
+    def installed(self) -> bool:
+        """Whether this extractor can run at all. Absence is normal, not an error."""
+        return False
+
+    def stream_url(self, video_id: str, *, timeout: float) -> str | None:
+        """The direct media URL for ``video_id``, or ``None`` when it cannot be had."""
+        return None
+
+
+class YtDlpExtractor(Extractor):
+    """``yt-dlp --skip-download --get-url``.
+
+    Metadata only. ``--get-url`` resolves the provider's player response and prints
+    the stream URL; ``--skip-download`` is what guarantees no media is fetched. That
+    player response is the one piece of traffic in this module that is *not* charged
+    to the byte budget — the watch page and its player script are a few hundred
+    kilobytes, they are what makes a stream URL knowable at all, and they are not the
+    video. Every media byte after that goes through the analysis proxy and is counted.
+
+    The command is built as an argv list and run through :func:`_run`, never as a
+    shell string: ``video_id`` arrives validated by :func:`classify_url`, and it stays
+    that way rather than becoming something a shell gets to re-parse.
+    """
+
+    #: A progressive (audio+video in one container) MP4 is what a seek-and-decode
+    #: wants: one URL, one container, no stream pairing. `best` is already
+    #: "progressive" in yt-dlp's terms — it never selects a video-only or audio-only
+    #: rendition — so the mp4 preference is the only thing being expressed here, and
+    #: a video with no mp4 rendition still resolves.
+    _FORMAT = "best[ext=mp4]/best"
+
+    def __init__(self, watch: str = "https://www.youtube.com/watch?v={id}") -> None:
+        #: The watch-page template, with one ``{id}`` placeholder. Rebuilt from the
+        #: validated ID rather than reused from the caller's string, which may be a
+        #: `/shorts/` or `youtu.be` variant, or carry a playlist and a start time.
+        self.watch = watch
+
+    def installed(self) -> bool:
+        return bool(shutil.which("yt-dlp") or shutil.which("yt-dlp.exe"))
+
+    def stream_url(self, video_id: str, *, timeout: float) -> str | None:
+        exe = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
+        if not exe:
+            return None
+        exe = str(exe)
+        page = self.watch.format(id=video_id)
+        try:
+            proc = _run(
+                [
+                    exe,
+                    "--skip-download",
+                    "--no-playlist",
+                    "--get-url",
+                    "-f",
+                    self._FORMAT,
+                    page,
+                ],
+                timeout,
+                what=f"resolving a stream URL for {page}",
+            )
+        except RemoteMediaError as exc:
+            # A timeout is not a discovery that the video has no stream; it is this
+            # machine giving up. Either way the caller falls back to what the host
+            # publishes, with a note saying the video was not sampled, so this is a
+            # debug line rather than a failure.
+            logger.debug("extractor gave up on %s: %s", page, exc)
+            return None
+        if proc.returncode != 0:
+            # Age walls, region blocks, removals and DRM all land here, as a non-zero
+            # exit and a sentence on stderr. That sentence is the only statement about
+            # which of them it was that anyone can make from here, so it is logged
+            # rather than guessed at.
+            reason = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+            logger.info("extractor could not resolve %s: %s", page, reason[-1] if reason else proc.returncode)
+            return None
+        for line in proc.stdout.decode("utf-8", "replace").splitlines():
+            candidate = line.strip()
+            if candidate.startswith("http://") or candidate.startswith("https://"):
+                return candidate
+        logger.debug("extractor printed no URL for %s", page)
+        return None
+
+
+#: Swapped out in tests, like :data:`TRANSPORT`: the real thing spawns a process, and
+#: a test must be able to answer without one. This is the YouTube extractor, which is
+#: the case documented in the README; :data:`_EXTRACTORS` holds the other hosts.
+EXTRACTOR: Extractor = YtDlpExtractor()
+
+#: Per-provider extractors, keyed by the name :func:`classify_url` returns. A host
+#: missing from here keeps today's behaviour: its published stills, labelled as such.
+_EXTRACTORS: dict[str, Extractor] = {
+    "vimeo": YtDlpExtractor("https://vimeo.com/{id}"),
+}
+
+
+def _extractor_for(provider: str) -> Extractor | None:
+    """The extractor for ``provider``, or ``None`` when there is none.
+
+    YouTube reads the module-level :data:`EXTRACTOR` on every call rather than a
+    captured reference, so reassigning it in a test changes what the probe uses.
+    """
+    if provider == "youtube":
+        return EXTRACTOR
+    return _EXTRACTORS.get(provider)
+
+
 def _ffprobe(src: str, limits: RemoteLimits, *, timeout: float | None = None) -> dict[str, Any] | None:
     """Container metadata, or ``None`` when ffprobe is not installed.
 
@@ -1103,11 +1248,18 @@ def _dedupe(frames: Iterable[bytes]) -> list[bytes]:
 
     A static shot sampled eight times is one picture; sending eight copies of it to
     the model is eight times the cost for none of the information.
+
+    The fingerprint is a digest of the whole frame, not a prefix of it. Two JPEGs
+    that share their first 512 bytes and differ only in the tail — two frames of the
+    same still scene, which is exactly the case this exists for — would collide under
+    a prefix compare, and the second frame would be dropped as a duplicate that was
+    never a duplicate. Sixty-four bits of blake2b over the whole payload has no such
+    blind spot, and costs nothing next to a decode.
     """
     seen: set[bytes] = set()
     out: list[bytes] = []
     for frame in frames:
-        key = frame[:512] + bytes([len(frame) % 251])
+        key = hashlib.blake2b(frame, digest_size=8).digest()
         if key in seen:
             continue
         seen.add(key)
@@ -1122,11 +1274,15 @@ def _dedupe(frames: Iterable[bytes]) -> list[bytes]:
 class EmbedHost:
     """Everything needed to describe a video on a host we cannot download.
 
-    ``frames`` is honest about where the pictures come from: YouTube publishes four
-    stills from the video at fixed points, and they are real frames at real
-    timestamps. That is a genuinely useful answer for "what happens in it" without
-    touching the stream, and it is reported as exactly that rather than as "8
-    sampled frames".
+    ``frames`` is honest about where the pictures come from, and it is a list of
+    *stills the host chose to publish*, not a sample this tool took. They are JPEGs
+    and they are pictures from the video, so they answer "what is this" — but nobody
+    documents which points of the video they were taken from, so nothing here claims
+    a timestamp for them. They are reported as stills, never as "8 sampled frames",
+    to stop a caller drawing a rate or a duration inference out of them.
+
+    ``frames`` is exactly the count of the tuple: the poster above it is a fourth
+    picture on YouTube, not a fourth frame.
     """
 
     oembed: str
@@ -1147,9 +1303,11 @@ _EMBED_HOSTS: dict[str, EmbedHost] = {
             "https://i.ytimg.com/vi/{id}/hq3.jpg",
         ),
         frames_note=(
-            "YouTube publishes four stills from this video (around 1/8, 3/8, 5/8 and 7/8 "
-            "of its length); those are the frames above. The video itself was not fetched "
-            "— it can only be played, not downloaded, from here."
+            "The pictures above are three stills YouTube publishes for this video, plus "
+            "the poster. YouTube does not document which points of the video those "
+            "stills were taken from, so no timestamp is claimed for them, and they are "
+            "not a sample of the video's progress through its runtime. The video itself "
+            "was not fetched — it can only be played, not downloaded, from here."
         ),
     ),
     "vimeo": EmbedHost(
@@ -1185,6 +1343,47 @@ def _fetch_bytes(
             return b"", ""
 
 
+#: What the note says when the video itself was sampled, rather than described from
+#: the pictures its host publishes. Duration is named because it is the one fact the
+#: stills cannot supply and the frames' spacing silently depends on.
+def _decoded_note(duration: float | None) -> str:
+    runs = f" It runs {_format_duration(duration)}." if duration else ""
+    return (
+        "These frames were decoded from the video itself, not read off the stills its "
+        "host publishes: an extractor resolved a direct stream URL for this call, and "
+        "that URL — which is session- and timestamp-bound — has already been discarded. "
+        "Nothing was downloaded or saved." + runs
+    )
+
+
+#: The video was not sampled because there is nothing here to sample it with. Naming
+#: the switch is the difference between a note and a dead end. It deliberately makes
+#: no claim about the pictures: whether there are any is decided below, by whether the
+#: host actually served one, and the note that describes them is only added when it
+#: did.
+_NO_EXTRACTOR_NOTE = (
+    "The video itself was not sampled: no stream extractor is installed here, so "
+    "there is no way to ask {provider} what the underlying stream is. `yt-dlp` on "
+    "PATH plus `REMOTE_EXTRACT_EMBEDS=true` is what turns that on."
+)
+
+#: The extractor ran and would not give up a stream URL.
+_EXTRACT_REFUSED_NOTE = (
+    "The video itself was not sampled: the extractor ran and {provider} would not "
+    "hand it a stream URL. Age-restricted, region-blocked, removed, DRM-protected and "
+    "not-yet-premiered videos all look like this from here, and only a browser can say "
+    "which one it is."
+)
+
+#: A stream URL came back, but nothing could be decoded out of it.
+_EXTRACT_UNREADABLE_NOTE = (
+    "A stream URL was resolved for this video but no frame could be decoded from it, "
+    "so no picture here was read from the video itself. A live stream, a video whose "
+    "renditions are still being processed, and a codec this machine cannot decode all "
+    "look like this."
+)
+
+
 def _resolve_embed(
     url: str,
     provider: str,
@@ -1193,6 +1392,7 @@ def _resolve_embed(
     *,
     limits: RemoteLimits,
     want_frames: int,
+    target_fps: float = 1.0,
     deadline: float | None = None,
 ) -> RemoteMedia:
     host = _EMBED_HOSTS[provider]
@@ -1236,10 +1436,59 @@ def _resolve_embed(
     )
 
     frames: list[bytes] = []
+    origin = ""
     note_bits: list[str] = []
-    if want_frames > 0 and host.frames:
+    duration = _as_float(oembed.get("duration")) if isinstance(oembed, dict) else None
+    width = _as_int(oembed.get("width") if isinstance(oembed, dict) else None)
+    height = _as_int(oembed.get("height") if isinstance(oembed, dict) else None)
+    codec = ""
+
+    # ── the video itself, when there is something here that can reach it ───────
+    # Only for a caller that asked for frames. `display_media` wants a poster and a
+    # player, and spawning an extractor for that would be a process for nothing.
+    if want_frames > 0 and limits.extract_embeds:
+        extractor = _extractor_for(provider)
+        if extractor is None or not extractor.installed():
+            note_bits.append(_NO_EXTRACTOR_NOTE.format(provider=provider))
+        else:
+            stream = extractor.stream_url(video_id, timeout=_left(deadline, limits.extract_timeout))
+            if not stream:
+                note_bits.append(_EXTRACT_REFUSED_NOTE.format(provider=provider))
+            else:
+                # `poster_wanted=not poster`: the host's thumbnail is the picture a
+                # player wants for this embed, and it is already in hand. Decoding a
+                # second one would spend a seek to replace a better image.
+                sample: RemoteMedia | None = None
+                try:
+                    sample = _sample_extracted(
+                        stream,
+                        kind="video",
+                        limits=limits,
+                        budget=budget,
+                        poster_wanted=not poster,
+                        frames_wanted=want_frames,
+                        target_fps=target_fps,
+                        deadline=deadline,
+                    )
+                except RemoteMediaError as exc:
+                    logger.info("the stream extracted for %s could not be decoded: %s", url, exc)
+                if sample is not None and sample.frames:
+                    frames, origin = sample.frames, "decoded"
+                    duration = sample.duration or duration
+                    width = sample.width or width
+                    height = sample.height or height
+                    codec = sample.codec
+                    if not poster and sample.poster:
+                        poster, poster_type = sample.poster, "image/jpeg"
+                    note_bits.append(_decoded_note(sample.duration))
+                else:
+                    note_bits.append(_EXTRACT_UNREADABLE_NOTE.format(provider=provider))
+
+    if not frames and want_frames > 0 and host.frames:
         fetched: list[bytes] = []
-        for template in host.frames[: max(0, want_frames)]:
+        # Capped by `frames_max` like the direct path is: a ceiling a caller can walk
+        # past by asking for a URL instead of a file is not a ceiling.
+        for template in host.frames[: max(0, min(want_frames, limits.frames_max))]:
             data, _ = _fetch_bytes(
                 template.format(id=video_id),
                 budget=budget,
@@ -1250,16 +1499,28 @@ def _resolve_embed(
                 fetched.append(data)
         # Deduplicated for the same reason the direct path is: a video that is one
         # colour must not be described as four different frames.
-        frames = _dedupe(fetched)
-        if frames:
+        stills = _dedupe(fetched)
+        if stills:
+            frames = stills
+            origin = "published_stills"
             note_bits.append(host.frames_note)
-            if len(frames) < len(fetched):
-                extra = len(fetched) - len(frames)
+            if len(stills) < len(fetched):
+                extra = len(fetched) - len(stills)
                 note_bits.append(
                     f"{extra} of the {len(fetched)} stills published for this video were "
                     f"identical, so {extra} fewer {'is' if extra == 1 else 'are'} shown."
                 )
-    elif want_frames > 0:
+        else:
+            # The host has a still template and served nothing usable from it. Silently
+            # returning no frames would leave the caller to work out why; a live stream
+            # is the usual reason, and it is the one this sentence names.
+            note_bits.append(
+                f"{provider} has stills for its other videos but served none that could "
+                "be read for this one, so there is nothing to look at here. A live "
+                "stream is the usual reason: until it ends there is no point in it to "
+                "take a still from."
+            )
+    elif not frames and want_frames > 0:
         note_bits.append(
             f"{provider} publishes one still image for this video and no frame samples, so "
             "only the poster is available. The video itself cannot be read without "
@@ -1277,20 +1538,83 @@ def _resolve_embed(
         kind="embed",
         content_type="text/html",
         name=title or f"{provider} video {video_id}",
-        duration=_as_float(oembed.get("duration")) if isinstance(oembed, dict) else None,
-        width=_as_int(oembed.get("width") if isinstance(oembed, dict) else None),
-        height=_as_int(oembed.get("height") if isinstance(oembed, dict) else None),
+        duration=duration,
+        width=width,
+        height=height,
         poster=poster or None,
         frames=frames,
+        codec=codec,
         provider=provider,
         video_id=video_id,
         embed_url=embed_url or host.play.format(id=video_id),
         title=title,
         author=author,
         playable=True,
+        frames_origin=origin,
         note=" ".join(note_bits),
         bytes_read=budget.used,
     )
+
+
+def _sample_extracted(
+    media_url: str,
+    *,
+    kind: str,
+    limits: RemoteLimits,
+    budget: ByteBudget,
+    poster_wanted: bool,
+    frames_wanted: int,
+    target_fps: float,
+    deadline: float,
+) -> RemoteMedia:
+    """Sample frames straight out of a URL an extractor just produced.
+
+    Two things make this different from :func:`_resolve_direct`, and both are the
+    point of the function existing at all:
+
+    * **No stream token.** A URL minted by an extractor is session- and timestamp-
+      bound and stops working within hours. Handing it to the player would put a dead
+      link in the transcript and leave a live origin URL in :func:`sources` after the
+      call, so this registers an *analysis* token only and forgets it in the
+      ``finally`` below — the same discipline :func:`_resolve_direct` already applies
+      to its own analysis token.
+    * **No probe.** There is nothing to classify: the extractor was asked for a
+      playable stream for a video, and `classify_url` already told us which host it
+      belongs to. Constructing the :class:`Head` here is what keeps this from
+      becoming a second HTTP round trip with a second failure mode.
+    """
+    headers = _base_headers(media_url)
+    content_type = "video/mp4" if kind == "video" else "audio/mpeg"
+    head = Head(url=media_url, status=200, content_type=content_type, length=None, ranges=True)
+    name = _name_for(media_url, content_type, kind)
+    probe_token = _register(
+        media_url,
+        headers,
+        name=name,
+        content_type=content_type,
+        timeout=limits.timeout,
+        budget=budget,
+    )
+    try:
+        return _sample(
+            head,
+            kind=kind,
+            name=name,
+            headers=headers,
+            limits=limits,
+            budget=budget,
+            poster_wanted=poster_wanted,
+            frames_wanted=frames_wanted,
+            target_fps=target_fps,
+            stream_token="",
+            probe_token=probe_token,
+            note="",
+            deadline=deadline,
+            publish_stream=False,
+        )
+    finally:
+        forget(probe_token)
+
 
 
 def _looks_like_image(data: bytes, content_type: str = "") -> bool:
@@ -1421,6 +1745,7 @@ def _resolve_direct(
     depth: int = 0,
     note: str = "",
     deadline: float | None = None,
+    publish_stream: bool = True,
 ) -> RemoteMedia:
     headers = _base_headers(url)
     deadline = deadline if deadline is not None else time.monotonic() + limits.total_timeout
@@ -1483,13 +1808,22 @@ def _resolve_direct(
 
     # ── it is a video or an audio file ────────────────────────────────────────
     name = _name_for(head.url, head.content_type, kind)
-    stream_token = _register(
-        head.url,
-        headers,
-        name=name,
-        content_type=head.content_type,
-        timeout=limits.timeout,
-        budget=None,
+    # The stream token is what the *browser* is allowed to fetch, so it is minted
+    # only when the player may have this URL at all. An extracted stream URL is
+    # session- and timestamp-bound and belongs to no player we can hand it to, so
+    # `publish_stream=False` mints no token for it — and the URL then cannot appear
+    # in `block()` or survive in `sources()` once this call returns.
+    stream_token = (
+        _register(
+            head.url,
+            headers,
+            name=name,
+            content_type=head.content_type,
+            timeout=limits.timeout,
+            budget=None,
+        )
+        if publish_stream
+        else ""
     )
     probe_token = _register(
         head.url,
@@ -1514,12 +1848,14 @@ def _resolve_direct(
             probe_token=probe_token,
             note=note,
             deadline=deadline,
+            publish_stream=publish_stream,
         )
     except BaseException:
         # Nothing may keep a token for a probe that failed: the registry is what the
         # proxy serves from, and a half-registered source is a URL reachable from the
         # browser with no manifest behind it.
-        forget(stream_token)
+        if publish_stream:
+            forget(stream_token)
         raise
     finally:
         # The analysis token exists only for this call. Keeping it would leave a
@@ -1543,6 +1879,7 @@ def _sample(
     probe_token: str,
     note: str,
     deadline: float,
+    publish_stream: bool = True,
 ) -> RemoteMedia:
     """Pull the poster and the frames for a source already classified as media.
 
@@ -1612,8 +1949,8 @@ def _sample(
     if kind == "audio" and want:
         bits.append("Audio has no frames to sample; inspect_media reports its details instead.")
 
-    stream_url = _proxy_url(stream_token, limits)
-    if not stream_url:
+    stream_url = _proxy_url(stream_token, limits) if publish_stream else ""
+    if publish_stream and not stream_url:
         bits.append(
             "No local stream proxy is available, so the player will request the original "
             "URL directly; some hosts refuse that."
@@ -1632,6 +1969,7 @@ def _sample(
         stream_url=stream_url,
         codec=str(facts.get("codec") or ""),
         ranges=head.ranges,
+        frames_origin="decoded" if frames else "",
         note=" ".join(bit for bit in bits if bit),
         bytes_read=budget.used,
     )
@@ -1703,6 +2041,12 @@ class RemoteMedia:
     embed_url: str = ""
     title: str = ""
     author: str = ""
+    #: Where ``frames`` came from: ``"decoded"`` for frames this tool pulled out of
+    #: the video itself, ``"published_stills"`` for pictures the host publishes, and
+    #: ``""`` when there are no frames at all. Every consumer that describes ``frames``
+    #: must read it: "sampled at ~1.00 fps" is a lie about a still, and the two cases
+    #: are indistinguishable from ``frames`` alone.
+    frames_origin: str = ""
     note: str = ""
     bytes_read: int = 0
 
@@ -1842,6 +2186,7 @@ def resolve_remote(
             embed_url,
             limits=limits,
             want_frames=max(0, int(want_frames)),
+            target_fps=float(target_fps or 1.0),
             deadline=deadline,
         )
 

@@ -142,6 +142,8 @@ See `.env.example` for the annotated list. The important ones:
 | `REMOTE_MEDIA_TOTAL_TIMEOUT` | `90` | wall-clock budget for resolving one remote URL |
 | `REMOTE_MEDIA_PROXY` | `true` | stream remote video through a loopback proxy instead of the origin |
 | `REMOTE_MEDIA_ALLOW_PRIVATE` | `false` | allow loopback/LAN URLs as remote media |
+| `REMOTE_EXTRACT_EMBEDS` | `false` | resolve a real stream URL for a YouTube/Vimeo embed so it can be sampled (needs `yt-dlp` on `PATH`) |
+| `REMOTE_EXTRACT_TIMEOUT` | `30` | wall-clock budget for one extraction attempt |
 | `CONTEXT_SAFETY_RATIO` | `0.92` | how full the context may get before old turns are dropped |
 
 ### `providers.json`
@@ -543,11 +545,22 @@ sampled keyframes — and nothing else is written to the conversation:
   a token-guarded loopback proxy that streams the bytes through with the headers the origin
   wanted. The token is random, the budget on it is only for analysis, and the proxy is bound to
   `127.0.0.1`. `REMOTE_MEDIA_PROXY=false` turns it off — nothing else changes.
-- A **YouTube or Vimeo URL is never downloaded or decoded at all.** oEmbed supplies the title,
-  author and size, a poster comes from the thumbnail, and the player is an iframe
-  (`youtube-nocookie.com`, `player.vimeo.com`) that only appears when the user presses play.
-  YouTube's own `hq1/2/3.jpg` stills are offered as frames, because they are real frames at real
-  timestamps.
+- A **YouTube or Vimeo URL is described, not downloaded.** oEmbed supplies the title, author and
+  size, a poster comes from the thumbnail, and the player is an iframe (`youtube-nocookie.com`,
+  `player.vimeo.com`) that only appears when the user presses play. YouTube's own `hq1/2/3.jpg`
+  stills are offered as frames, and labelled for exactly what they are: pictures the host
+  publishes, at points the host does not document. Nothing here claims a timestamp or a sampling
+  rate for them, and a result that carries them says "still", not "sampled".
+- **Reading an embed's real stream is opt-in.** With `yt-dlp` on `PATH` and
+  `REMOTE_EXTRACT_EMBEDS=true`, `reduce_video_frames` asks the extractor for the underlying
+  stream URL and runs the ordinary seek-and-decode against it, so the frames are the video's own
+  and its duration is known. The extracted URL is session- and timestamp-bound and expires; it is
+  reached only through an analysis token that dies with the call, so it never reaches the player
+  and is never written into the conversation. If the extractor is missing, refuses (age wall,
+  region block, removal, DRM, a live stream) or returns something undecodable, the host's stills
+  are used and the result says which of those it was. Default `false`: "read the provider's own
+  stream" is a call about a provider's terms rather than a technical one, and `yt-dlp` is a
+  fast-moving dependency that is expected to break.
 
 Refusals are specific, because "it did not work" is useless to a model: a login wall, a
 geo-block, a DRM-protected stream, an HLS/DASH playlist (a segmented stream is not a file),

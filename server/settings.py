@@ -75,6 +75,10 @@ REMOTE_FRAMES_MAX_VAR = "REMOTE_FRAMES_MAX"
 REMOTE_MEDIA_ALLOW_PRIVATE_VAR = "REMOTE_MEDIA_ALLOW_PRIVATE"
 #: Turn the local stream proxy off. Playback then goes straight to the origin.
 REMOTE_MEDIA_PROXY_VAR = "REMOTE_MEDIA_PROXY"
+#: Resolve a real stream URL for a YouTube/Vimeo embed so the video itself can be
+#: sampled. Off by default — see `remote_media.RemoteLimits.extract_embeds`.
+REMOTE_EXTRACT_EMBEDS_VAR = "REMOTE_EXTRACT_EMBEDS"
+REMOTE_EXTRACT_TIMEOUT_VAR = "REMOTE_EXTRACT_TIMEOUT"
 
 __all__ = [
     "Settings",
@@ -93,6 +97,8 @@ __all__ = [
     "REMOTE_FRAMES_MAX_VAR",
     "REMOTE_MEDIA_ALLOW_PRIVATE_VAR",
     "REMOTE_MEDIA_PROXY_VAR",
+    "REMOTE_EXTRACT_EMBEDS_VAR",
+    "REMOTE_EXTRACT_TIMEOUT_VAR",
     "is_usable_key",
     "mask_key",
     "read_env_var",
@@ -234,6 +240,17 @@ class Settings:
     #: otherwise be pointed at on a developer's machine all day are this server
     #: itself and a local model daemon, and neither is a video.
     remote_media_allow_private: bool = False
+    #: Resolve a real stream URL for a YouTube/Vimeo embed so the video itself can be
+    #: sampled, instead of showing the stills its host publishes. Off by default:
+    #: it is a decision about a provider's terms rather than a technical one, and the
+    #: tool that does it (`yt-dlp`) is a fast-moving dependency that parses a moving
+    #: web player and is expected to break. Its absence is normal, is reported, and
+    #: falls back to the host's stills — labelled as stills.
+    remote_extract_embeds: bool = False
+    #: Wall-clock ceiling for one extraction attempt. Separate from
+    #: `remote_media_timeout`, which covers one HTTP request; `remote_media_total_timeout`
+    #: still bounds the whole probe.
+    remote_extract_timeout: float = 30.0
 
     #: Values changed at runtime from the settings panel.
     #:
@@ -605,6 +622,8 @@ def load_settings(
         remote_frame_max_dim=_as_int(var("REMOTE_FRAME_MAX_DIM"), 512),
         remote_media_proxy=_as_bool(var(REMOTE_MEDIA_PROXY_VAR), True),
         remote_media_allow_private=_as_bool(var(REMOTE_MEDIA_ALLOW_PRIVATE_VAR), False),
+        remote_extract_embeds=_as_bool(var(REMOTE_EXTRACT_EMBEDS_VAR), False),
+        remote_extract_timeout=_as_float(var(REMOTE_EXTRACT_TIMEOUT_VAR), 30.0),
     )
 
     if overrides:

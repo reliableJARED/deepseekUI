@@ -855,6 +855,7 @@ def test_a_youtube_url_becomes_an_embed_with_its_own_stills(net):
     assert (found.duration, found.width, found.height) == (212.0, 1920, 1080)
     assert found.poster == JPEG
     assert found.frames == [JPEG], "one still repeated four times is one still"
+    assert found.frames_origin == "published_stills", "nobody sampled this video"
     assert "was not fetched" in found.note
     assert "2 of the 3 stills" in found.note, "and the duplicate is owned up to"
     assert found.url == YOUTUBE
@@ -881,7 +882,9 @@ def test_youtube_stills_are_deduplicated_when_they_differ(net):
     found = resolve_remote(YOUTUBE, limits=limits(), want_frames=4, poster=True)
 
     assert found.frames == [JPEG + b"1", JPEG + b"2", JPEG + b"3"]
-    assert "1/8, 3/8, 5/8 and 7/8" in found.note
+    assert "three stills YouTube publishes for this video" in found.note
+    assert "no timestamp is claimed for them" in found.note
+    assert "not a sample of the video's progress" in found.note
     assert "identical" not in found.note, "nothing was dropped, so nothing to explain"
 
 
@@ -923,8 +926,302 @@ def test_vimeo_has_no_frame_samples_and_says_so(net):
 
     assert found.kind == "embed"
     assert found.frames == []
+    assert found.frames_origin == ""
     assert "publishes one still image for this video and no frame samples" in found.note
     assert found.embed_url == "https://player.vimeo.com/video/123456789"
+
+
+# ── sampling the video behind an embed, when an extractor is there ───────────
+
+STREAM = "https://cdn.example.com/resolved-stream.mp4"
+
+
+class FakeExtractor:
+    """Stands in for the yt-dlp CLI: two answers and a call log, and nothing else.
+
+    ``installed`` is separate from ``stream`` on purpose. "Nothing here can do this"
+    and "the thing that could do it would not" are different answers to the caller,
+    and a single ``None`` return would collapse them.
+    """
+
+    def __init__(self, stream: str | None = STREAM, *, installed: bool = True):
+        self.stream = stream
+        self._installed = installed
+        self.calls: list[tuple[str, float]] = []
+
+    def installed(self) -> bool:
+        return self._installed
+
+    def stream_url(self, video_id: str, *, timeout: float) -> str | None:
+        self.calls.append((video_id, timeout))
+        return self.stream
+
+
+@pytest.fixture
+def extractor(monkeypatch):
+    """Install a fake extractor, and keep the real CLI out of every other host.
+
+    ``_EXTRACTORS`` is emptied as well as ``EXTRACTOR`` being replaced, because the
+    real per-provider table is built at import time and would otherwise let a test
+    reach a real subprocess through the Vimeo entry.
+    """
+
+    def install(fake: FakeExtractor) -> FakeExtractor:
+        monkeypatch.setattr(remote_media, "EXTRACTOR", fake)
+        monkeypatch.setattr(remote_media, "_EXTRACTORS", {})
+        return fake
+
+    return install
+
+
+THUMB = "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
+
+
+def embed_routes(record: dict, *, stills: bool = True) -> dict:
+    """The oEmbed answer, the poster, and the three stills YouTube publishes."""
+    routes = {
+        oembed_url(YOUTUBE): media(json.dumps(record).encode(), ctype="application/json"),
+        THUMB: media(JPEG, ctype="image/jpeg"),
+    }
+    if stills:
+        for name in ("hq1.jpg", "hq2.jpg", "hq3.jpg"):
+            routes["https://i.ytimg.com/vi/dQw4w9WgXcQ/" + name] = media(
+                JPEG + name[:3].encode(), ctype="image/jpeg"
+            )
+    return routes
+
+
+def test_an_extracted_stream_is_sampled_and_says_the_frames_are_decoded(net, decoder, extractor):
+    """The whole point of the switch: real frames, from the video itself."""
+    fake_decoder = decoder(duration=6.0)
+    fake = extractor(FakeExtractor())
+    transport = net(
+        embed_routes(
+            {
+                "title": "A Video",
+                "author_name": "Someone",
+                "duration": 212,
+                "width": 1920,
+                "height": 1080,
+                "thumbnail_url": THUMB,
+            }
+        )
+    )
+
+    found = resolve_remote(
+        YOUTUBE, limits=limits(extract_embeds=True), want_frames=3, poster=True, target_fps=1.0
+    )
+
+    assert found.kind == "embed", "it is still an embed: the player is the iframe"
+    assert found.frames_origin == "decoded"
+    assert len(found.frames) == 3
+    assert all(frame[:3] == b"\xff\xd8\xff" for frame in found.frames)
+    assert fake_decoder.sources, "the decoder was handed the resolved stream"
+    assert {src for src in fake_decoder.sources} == {STREAM}
+    assert found.duration == 6.0, "a measured duration replaces oEmbed's unverified one"
+    assert "decoded from the video itself" in found.note
+    assert "has already been discarded" in found.note
+    assert "was not fetched" not in found.note, "the stills were not what was used"
+    assert not any("hq1.jpg" in url for url in transport.urls), "no still was needed"
+    assert fake.calls == [("dQw4w9WgXcQ", 30.0)]
+
+
+def test_an_embed_is_not_sampled_unless_the_switch_is_on(net, decoder, extractor):
+    """Off by default: no process is spawned for a caller who did not ask."""
+    decoder(duration=6.0)
+    fake = extractor(FakeExtractor())
+    net(embed_routes({"title": "T", "duration": 212}))
+
+    found = resolve_remote(YOUTUBE, limits=limits(), want_frames=3, poster=True)
+
+    assert found.frames_origin == "published_stills"
+    assert fake.calls == []
+    assert "three stills YouTube publishes" in found.note
+
+
+def test_a_missing_extractor_is_named_rather_than_merely_failing(net, extractor):
+    """Absence of yt-dlp is normal, and the note says which switch would fix it."""
+    fake = extractor(FakeExtractor(installed=False))
+    net(embed_routes({"title": "T"}))
+
+    found = resolve_remote(YOUTUBE, limits=limits(extract_embeds=True), want_frames=3, poster=True)
+
+    assert found.frames_origin == "published_stills"
+    assert len(found.frames) == 3
+    assert "no stream extractor is installed here" in found.note
+    assert "yt-dlp" in found.note and "REMOTE_EXTRACT_EMBEDS=true" in found.note
+    assert fake.calls == [], "nothing is here to ask"
+
+
+def test_an_extractor_that_will_not_produce_a_url_falls_back_to_the_stills(net, extractor):
+    """Refusal is an answer, not an exception: the stills are used and said to be stills."""
+    fake = extractor(FakeExtractor(None))
+    net(embed_routes({"title": "T"}))
+
+    found = resolve_remote(YOUTUBE, limits=limits(extract_embeds=True), want_frames=3, poster=True)
+
+    assert found.frames_origin == "published_stills"
+    assert len(found.frames) == 3
+    assert found.duration is None, "oEmbed gave no duration and nothing measured one"
+    assert "would not hand it a stream URL" in found.note
+    assert "age-restricted" in found.note.lower()
+    assert fake.calls == [("dQw4w9WgXcQ", 30.0)]
+
+
+def test_a_stream_that_decodes_nothing_falls_back_to_the_stills(net, decoder, extractor, monkeypatch):
+    """A URL came back and was useless. That is not a sample either."""
+    decoder(duration=6.0)
+    extractor(FakeExtractor())
+    monkeypatch.setattr(remote_media, "_decode_one", lambda *a, **k: b"")
+    monkeypatch.setattr(remote_media, "_decode_with_opencv", lambda *a, **k: [])
+    net(embed_routes({"title": "T"}))
+
+    found = resolve_remote(YOUTUBE, limits=limits(extract_embeds=True), want_frames=3, poster=True)
+
+    assert found.frames_origin == "published_stills"
+    assert len(found.frames) == 3
+    assert "no frame could be decoded from it" in found.note
+    assert "live stream" in found.note
+    assert "decoded from the video itself" not in found.note
+
+
+def test_the_extracted_url_is_never_published_or_kept(net, decoder, extractor):
+    """The URL is session-bound. It may be read and must then be gone.
+
+    ``_register`` remembers a source whether or not the proxy is on, so an empty
+    registry afterwards is proof that no stream token was minted at all — which is
+    the only way a URL that dies within hours cannot reach the player or a later
+    call. An analysis token must not survive either.
+    """
+    decoder(duration=6.0)
+    extractor(FakeExtractor())
+    net(embed_routes({"title": "A Video"}))
+    before = set(remote_media.sources())
+
+    found = resolve_remote(YOUTUBE, limits=limits(extract_embeds=True), want_frames=2, poster=True)
+
+    block = found.block()
+    facts = found.facts()
+
+    assert block["type"] == "embed"
+    assert "stream" not in block, "a dead-in-hours URL must not be handed to the player"
+    assert STREAM not in json.dumps(block) + json.dumps(facts)
+    assert set(remote_media.sources()) == before, "no token for the extracted URL survived"
+    assert found.stream_url == ""
+
+
+def test_a_video_whose_stills_cannot_be_read_says_there_is_nothing_to_look_at(net, extractor):
+    """A live stream is the case: an oEmbed answer, and four 404s for the pictures.
+
+    The note must not describe pictures that are not there, and the empty result must
+    not be left unexplained — "no frames" and "no frames, and here is why" are
+    different answers.
+    """
+    extractor(FakeExtractor(installed=False))
+    routes = {
+        oembed_url(YOUTUBE): media(json.dumps({"title": "Live now"}).encode(), ctype="application/json"),
+        THUMB: failure(404, THUMB),
+    }
+    for name in ("hq1.jpg", "hq2.jpg", "hq3.jpg"):
+        url = "https://i.ytimg.com/vi/dQw4w9WgXcQ/" + name
+        routes[url] = failure(404, url)
+    net(routes)
+
+    found = resolve_remote(YOUTUBE, limits=limits(extract_embeds=True), want_frames=3, poster=True)
+
+    assert found.frames == [] and found.frames_origin == ""
+    assert found.poster is None
+    assert "nothing to look at here" in found.note
+    assert "a live stream is the usual reason" in found.note.lower()
+    assert "three stills YouTube publishes" not in found.note, "there are none to describe"
+    assert "No poster frame could be fetched" in found.note
+
+
+# ── the extractor itself, without a process ──────────────────────────────────
+
+
+class FakeProcess:
+    def __init__(self, *, stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
+def install_ytdlp(monkeypatch, found: str | None = r"C:\tools\yt-dlp.exe"):
+    """Pretend the CLI is on PATH, or pretend it is not."""
+    monkeypatch.setattr(
+        remote_media.shutil,
+        "which",
+        lambda name: found if found and name.startswith("yt-dlp") else None,
+    )
+
+
+def test_the_extractor_asks_for_a_url_and_never_for_the_video(monkeypatch):
+    """The binding rule, pinned by the argv: no download, and no shell to re-parse."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, timeout, *, what):
+        calls.append(list(cmd))
+        return FakeProcess(stdout=b"https://cdn.example.com/v.mp4\n")
+
+    install_ytdlp(monkeypatch)
+    monkeypatch.setattr(remote_media, "_run", fake_run)
+
+    extractor = remote_media.YtDlpExtractor()
+
+    assert extractor.installed()
+    assert extractor.stream_url("dQw4w9WgXcQ", timeout=30.0) == "https://cdn.example.com/v.mp4"
+    assert calls == [
+        [
+            r"C:\tools\yt-dlp.exe",
+            "--skip-download",
+            "--no-playlist",
+            "--get-url",
+            "-f",
+            "best[ext=mp4]/best",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        ]
+    ], "a download flag, a shell string, or a caller's URL reaching the argv is a bug"
+    assert not any(part in calls[0] for part in ("-o", "--output", "-x", "--extract-audio"))
+
+
+def test_the_extractor_gives_up_quietly_and_says_nothing_to_the_caller(monkeypatch):
+    """Every way this can fail is a ``None``: the caller falls back to the stills."""
+    install_ytdlp(monkeypatch)
+
+    def refusing(cmd, timeout, *, what):
+        return FakeProcess(returncode=1, stderr=b"ERROR: Sign in to confirm your age\n")
+
+    monkeypatch.setattr(remote_media, "_run", refusing)
+    assert remote_media.YtDlpExtractor().stream_url("dQw4w9WgXcQ", timeout=30.0) is None
+
+    def timing_out(cmd, timeout, *, what):
+        raise RemoteMediaError("the decoder did not finish in time", kind="network")
+
+    monkeypatch.setattr(remote_media, "_run", timing_out)
+    assert remote_media.YtDlpExtractor().stream_url("dQw4w9WgXcQ", timeout=30.0) is None
+
+    monkeypatch.setattr(
+        remote_media, "_run", lambda *a, **k: FakeProcess(stdout=b"[download] Destination: v.mp4\n")
+    )
+    assert remote_media.YtDlpExtractor().stream_url("dQw4w9WgXcQ", timeout=30.0) is None, (
+        "only an http(s) line is a URL"
+    )
+
+
+def test_without_the_tool_the_extractor_is_the_base_class_that_answers_nothing(monkeypatch):
+    """A machine with no yt-dlp is the normal case, not a broken one."""
+    install_ytdlp(monkeypatch, None)
+
+    assert remote_media.YtDlpExtractor().installed() is False
+    assert remote_media.YtDlpExtractor().stream_url("dQw4w9WgXcQ", timeout=30.0) is None
+    assert remote_media.Extractor().installed() is False
+    assert remote_media.Extractor().stream_url("dQw4w9WgXcQ", timeout=30.0) is None
+    assert remote_media._extractor_for("youtube") is remote_media.EXTRACTOR
+    assert remote_media._extractor_for("nobody.example") is None
+    assert isinstance(remote_media._extractor_for("vimeo"), remote_media.YtDlpExtractor)
+    assert remote_media.EXTRACTOR.watch == "https://www.youtube.com/watch?v={id}"
+    assert remote_media._EXTRACTORS["vimeo"].watch == "https://vimeo.com/{id}"
 
 
 # ── the manifest as a display block ──────────────────────────────────────────
@@ -988,12 +1285,23 @@ def toolset(tmp_path):
     ``REMOTE_MEDIA_PROXY=false``, because a test has no browser to hand a stream to
     and starting a loopback server per test would test the proxy, not the tool.
     """
+    return toolset_for(tmp_path)
+
+
+@pytest.fixture
+def extracting_toolset(tmp_path):
+    """The same tools, with ``REMOTE_EXTRACT_EMBEDS`` turned on."""
+    return toolset_for(tmp_path, {"REMOTE_EXTRACT_EMBEDS": "true"})
+
+
+def toolset_for(tmp_path, extra_env: dict | None = None):
     store = ConversationStore(tmp_path / "memory")
     store.create(uuid="conv1")
     settings = load_settings(
         {
             "REMOTE_MEDIA_PROXY": "false",
             "REMOTE_MEDIA_ALLOW_PRIVATE": "true",
+            **(extra_env or {}),
         },
         load_dotenv=False,
         memory_root=store.root,
@@ -1142,6 +1450,50 @@ async def test_reduce_video_frames_returns_frames_from_a_url(toolset, net, decod
     assert "not downloaded" in header
     assert "longest edge" in header
     assert "tokens" in header
+
+
+async def test_reduce_video_frames_on_an_embed_says_the_stills_are_stills(
+    toolset, net, decoder, extractor
+):
+    """The tool header is the claim the model reads. It must not say "Sampled"."""
+    decoder(duration=6.0)
+    extractor(FakeExtractor())
+    net(embed_routes({"title": "A Video"}))
+
+    result = await call(toolset, "reduce_video_frames", path=YOUTUBE, max_frames=3)
+
+    assert not result.is_error, text_of(result)
+    header = result.content[0]["text"]
+    assert "3 stills published by the host" in header
+    assert "the video stream was not read" in header
+    assert "Sampled" not in header, "nobody sampled this video"
+    assert "fps" not in header, "and so there is no rate to report"
+
+
+async def test_reduce_video_frames_reads_the_video_when_the_switch_is_on(
+    extracting_toolset, net, decoder, extractor
+):
+    """With extraction on, the header may say Sampled — because something was."""
+    decoder(duration=6.0)
+    extractor(FakeExtractor())
+    net(embed_routes({"title": "A Video"}))
+
+    result = await call(extracting_toolset, "reduce_video_frames", path=YOUTUBE, max_frames=3)
+
+    assert not result.is_error, text_of(result)
+    header = result.content[0]["text"]
+    assert "Sampled 3 frames" in header
+    assert "fps" in header
+    images = [
+        block for block in result.content if isinstance(block, dict) and block.get("type") == "image"
+    ]
+    assert len(images) == 3
+    assert STREAM not in json.dumps(result.content), "the resolved URL is not part of the answer"
+    assert all(
+        STREAM not in block.get("url", "") and STREAM not in block.get("stream", "")
+        for block in result.content
+        if isinstance(block, dict)
+    )
 
 
 async def test_reduce_video_frames_refuses_audio_with_its_facts_instead(toolset, net, decoder):
