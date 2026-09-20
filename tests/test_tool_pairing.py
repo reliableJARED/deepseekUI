@@ -480,12 +480,17 @@ def test_tool_images_follow_the_whole_group(store, media, settings):
 
 # ── media that is meant for the person ────────────────────────────────────────
 #
-# The second audience. A picture a tool produced *for the user* — a page image
-# `web_fetch` downloaded, a file `display_media` was handed — is cut out of the tool
-# result and hung on the assistant turn the user reads to, so the frontend can render
-# it above the answer. It must never reach the model: it is not the model's to look at
-# unless it asks (`inspect_media`), and leaving it in the transcript would charge it
-# for the image on every later request, forever.
+# The second audience. A picture a tool produced *for the user* — the file
+# `display_media` was handed — is cut out of the tool result and hung on the assistant
+# turn the user reads to, so the frontend can render it above the answer. It must never
+# reach the model: it is not the model's to look at unless it asks (`inspect_media`),
+# and leaving it in the transcript would charge it for the image on every later
+# request, forever.
+#
+# A page image `web_fetch` downloaded is the awkward third case, and it is the one that
+# made a mess: marked like the first (it is the user's, not the model's) but not pinned
+# like it, because nobody asked to see it. It stays in the result, which is drawn inside
+# the collapsed tool card — see `test_media_that_merely_arrived_stays_in_the_result_it_came_with`.
 
 def frames_of(frames: list[str], event: str) -> list:
     """The decoded payloads of every ``event`` frame in a turn's SSE output."""
@@ -511,8 +516,15 @@ def last_assistant(messages) -> dict:
     raise AssertionError("no assistant turn in the transcript")
 
 
-def shot_registry(*, display: bool):
-    """A tool that returns one PNG, optionally marked as being for the user."""
+def shot_registry(*, display: bool | str = "shown"):
+    """A tool that returns one PNG, marked as ``display`` for the user.
+
+    ``"shown"``/``True`` is a picture the user asked to see — it is pinned above the
+    reply. ``"inline"`` is a picture that merely arrived with the result, the way a
+    page's images arrive with ``web_fetch``: still marked, still never sent upstream,
+    but drawn inside the tool card. ``None``/``False`` leaves it unmarked, so it is the
+    model's to look at.
+    """
 
     async def shot(**kwargs):
         block = {
@@ -521,7 +533,7 @@ def shot_registry(*, display: bool):
             "mimeType": "image/png",
         }
         if display:
-            block["display"] = True
+            block["display"] = display
             block["caption"] = "the monkey"
         return [{"type": "text", "text": "took a picture"}, block]
 
@@ -618,6 +630,46 @@ async def test_media_the_model_asked_for_is_still_inlined(store, media, settings
     # It travels in a `user` turn, which is the only place the API accepts an image.
     assert roles(client.requests[1]) == ["user", "assistant", "tool", "user"]
     assert "data:image" in json.dumps(client.requests[1])
+
+
+async def test_media_that_merely_arrived_stays_in_the_result_it_came_with(store, media, settings):
+    """``web_fetch`` downloads a page's images because a page has images.
+
+    Nobody asked to see them, so they must not be pinned above the reply for the rest of
+    the conversation — that is where a row of page posters ends up standing between the
+    reader and every answer that follows. They stay in the result, which the frontend
+    draws inside the tool card that carried them, collapsed like the page text beside
+    them. Still marked, so keeping them there is not the same as showing them to the
+    model.
+    """
+    uuid = store.create(title="t").uuid
+    await store.append(uuid, user("read that page"))
+
+    client = FakeClient(assistant_turn(("c1", "shot", "{}")), final_turn("it says hello"))
+    engine = ChatEngine(settings, store, media, client, tool_registry=shot_registry(display="inline"))
+
+    frames = [frame async for frame in engine.stream_turn(uuid)]
+
+    written = store.load(uuid).messages
+    blocks = json.loads(written[2]["content"])
+    # Left where it was: with the prose that came with it, not cut out of the result.
+    assert [b["type"] for b in blocks] == ["text", "image"]
+    assert blocks[1]["display"] == "inline"
+    assert blocks[1]["url"].startswith(f"/memory/{uuid}/")
+    # And not hung on the reply, so nothing renders above the answer.
+    assert "_display" not in last_assistant(written)
+
+    # The live paint gets the same split: nothing to pin, and the media in the frame the
+    # card is filled from. Compared by url rather than by block, because the frame
+    # carries `_display_blocks`' whitelist of the stored block and not the stored block.
+    results = frames_of(frames, "tool_result")
+    assert results[0]["media"] == []
+    assert [b["type"] for b in results[0]["blocks"]] == ["text", "image"]
+    assert results[0]["blocks"][1]["url"] == blocks[1]["url"]
+
+    # Marked is not exempt: the model is handed the path in place of the picture.
+    assert "data:image" not in json.dumps(client.requests[1])
+    assert "was shown to the user" in json.dumps(client.requests[1])
 
 
 async def test_media_is_still_shown_when_the_step_limit_ends_the_turn(store, media):

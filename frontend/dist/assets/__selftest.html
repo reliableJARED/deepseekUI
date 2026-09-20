@@ -35,7 +35,7 @@ import {
 } from '/assets/highlight.js';
 import {
   blocksOf, codeBlock, durationText, elementForBlock, isEmbedBlock, isMediaBlock,
-  mediaRow, presentationFor, readFileListing, uiKindForFile,
+  mediaLabel, mediaRow, presentationFor, readFileListing, uiKindForFile,
 } from '/assets/media.js';
 import {
   API_KEY_HEADER, formatHeaders, parseHeaders, mcpApiKeyOf, mcpHeadersWithoutKey, withApiKey,
@@ -754,6 +754,29 @@ if (!elementForBlock({ type: 'code', lang: 'python', text: 'x = 1' }).classList.
 if (isMediaBlock({ type: 'code', lang: 'python', text: 'x = 1' })) {
   fail('a code block counts as media');
 }
+
+// The header of a *collapsed* card. Media that arrived with a tool result is drawn in
+// the card's body, and a closed card shows nothing but its header — so this count is
+// the only thing saying the pictures are there at all. It is counted by kind rather
+// than totalled, because "3 items" is not a reason to open anything.
+if (mediaLabel([]) !== '') fail('a result with nothing in it claims to hold media');
+if (mediaLabel([{ type: 'text', text: 'a page of prose' }]) !== '') {
+  fail('prose was counted as media');
+}
+const MIXED = [
+  { type: 'image', url: '/memory/c1/a.png' },
+  { type: 'image', url: '/memory/c1/b.png' },
+  { type: 'video', url: '/memory/c1/c.mp4' },
+  { type: 'audio', url: '/memory/c1/d.mp3' },
+  { type: 'text', text: 'not media' },
+  { type: 'image', name: 'no-bytes.png' },
+  { type: 'embed', url: 'https://www.youtube.com/watch?v=x' },
+];
+const mixedLabel = mediaLabel(MIXED);
+if (mixedLabel !== '2 images, 1 video, 1 audio') fail(`a mixed result reads as "${mixedLabel}"`);
+const embedded = [{ type: 'embed', url: 'https://www.youtube.com/watch?v=x', embed_url: 'https://www.youtube.com/embed/x' }];
+if (mediaLabel(embedded) !== '1 embed') fail(`an embed reads as "${mediaLabel(embedded)}"`);
+pass('mediaLabel counts what a collapsed tool card is holding');
 
 const settle = (ms = 0) => new Promise((done) => { setTimeout(done, ms); });
 const until = async (check, tries = 40) => {

@@ -280,6 +280,31 @@ export function isMediaBlock(block) {
   return Boolean(block.url || block.stream);
 }
 
+/**
+ * What a row of blocks holds, in words: `2 images, 1 video`, or `''` if none.
+ *
+ * For a *collapsed* card. Media that arrived with a tool result is drawn inside the
+ * card that carried it rather than pinned above the reply, and a closed card shows
+ * only its header — so without a word about it there, a page's images would be every
+ * bit as invisible as if they had been dropped. Kinds are counted rather than
+ * totalled because "3 items" says nothing about what is about to be opened.
+ */
+export function mediaLabel(blocks) {
+  // `isMediaBlock` is the same gate `renderBlocks` uses, and it accepts exactly these
+  // four kinds, so a block counted here is a block drawn there.
+  const counts = { image: 0, video: 0, audio: 0, embed: 0 };
+  for (const block of blocks || []) {
+    if (!isMediaBlock(block)) continue;
+    const kind = presentationFor(block);
+    if (kind in counts) counts[kind] += 1;
+  }
+  const parts = [];
+  for (const kind of ['image', 'video', 'audio', 'embed']) {
+    if (counts[kind]) parts.push(`${counts[kind]} ${kind}${counts[kind] === 1 ? '' : 's'}`);
+  }
+  return parts.join(', ');
+}
+
 /** True when a block is an embed we should draw a play affordance for. */
 export function isEmbedBlock(block) {
   return Boolean(block) && block.type === 'embed';

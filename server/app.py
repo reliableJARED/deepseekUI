@@ -113,12 +113,19 @@ class AppState:
     def _ingest_tool_media(self, uuid: str, blocks, tool_name: str):
         """Callback MCP tools use to persist the media they return.
 
-        Everything an MCP tool returns is marked user-facing. The reasoning is that a
-        remote tool hands back media because a *person* asked to see something
-        (``web_fetch`` downloads the images on the page it read), and leaving it in the
-        result is what buried it in a collapsed tool card. The model still gets each
-        file's path in place of the media, and can pull one back into its own vision
-        with ``resize_image`` or ``reduce_video_frames`` if it genuinely needs to look.
+        Everything an MCP tool returns is marked user-facing, but as *incidental* media:
+        a remote tool hands back media because of what it was asked to do rather than
+        because anyone asked to see a picture — ``web_fetch`` downloads the images on
+        the page it read, because a page has images. Nobody chose those, so they are
+        marked ``inline``: the block stays in the result and renders inside the tool
+        card that carried it, collapsed, instead of being pinned above the reply for
+        the life of the transcript.
+
+        The model still gets each file's path in place of the media — ``inline`` is a
+        mark, not an exemption, so :mod:`server.rehydrate` swaps it for a path exactly
+        as it does for a block ``display_media`` showed — and can pull one back into
+        its own vision with ``resize_image`` or ``reduce_video_frames`` if it genuinely
+        needs to look.
         """
         blocks = self.media.ingest_tool_blocks(uuid, blocks, tool_name)
         return mark_display_blocks(blocks)

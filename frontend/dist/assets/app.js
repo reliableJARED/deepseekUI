@@ -17,7 +17,7 @@
 import { api, ApiError, streamChat } from './api.js';
 import { markdown, toPlainText, escapeHtml } from './markdown.js';
 import {
-  blocksOf, isMediaBlock, elementForBlock, mediaRow, kindForFile, uiKindForFile, formatBytes, extOf,
+  blocksOf, isMediaBlock, mediaLabel, elementForBlock, mediaRow, kindForFile, uiKindForFile, formatBytes, extOf,
   readFileListing, copyText as copyToClipboard, revokePreview,
 } from './media.js';
 import { detectLanguage, languageForName, languageLabel } from './highlight.js';
@@ -137,12 +137,18 @@ function mediaGrid(blocks) {
 }
 
 /**
- * The media a tool showed to *you* rather than to the model.
+ * The media a tool showed to *you* on purpose rather than media it merely collected.
  *
  * The server cuts these out of the tool result, stores them on the assistant turn as
  * `_display`, and they render above the reply — the point of asking to see something
  * is to have it be the first thing you look at, not a card you have to open. The key
  * is deliberately underscore-prefixed, which is what keeps it out of the request.
+ *
+ * Only what was asked for ends up here. An image ``web_fetch`` pulled off the page it
+ * read was not asked for, so the server leaves it in the tool result and it is drawn
+ * inside that card, which is collapsed — see `fillToolBody`. A reply is what the
+ * reader is here for, and a row of page posters parked above it is attention taken
+ * from the reply for the entire life of the transcript.
  */
 function displayMedia(blocks) {
   if (!Array.isArray(blocks) || !blocks.length) return null;
@@ -151,16 +157,25 @@ function displayMedia(blocks) {
   return grid;
 }
 
-/** Render a message's blocks into `container`: text first, then media, then code. */
-function renderBlocks(container, blocks) {
+/**
+ * Render a message's blocks into `container`: text first, then media, then code.
+ *
+ * `mediaFirst` puts the media above the text instead. Only a tool card asks for it:
+ * a fetched page arrives as 60 kB of body text followed by whatever pictures came with
+ * it, and the pictures at the bottom of that are pictures nobody scrolls to. In the
+ * reply the order stays text-first, because there the prose is the thing being read.
+ */
+function renderBlocks(container, blocks, { mediaFirst = false } = {}) {
   const texts = blocks.filter((b) => b.type === 'text');
   const media = blocks.filter(isMediaBlock);
   const code = blocks.filter((b) => b.type === 'code');
   const others = blocks.filter((b) => b.type !== 'text' && b.type !== 'code' && !isMediaBlock(b));
 
-  if (texts.length) container.append(proseElement(texts.map((b) => b.text).join('\n\n')));
   const grid = media.length ? mediaGrid(media) : null;
-  if (grid) container.append(grid);
+  const text = texts.length ? proseElement(texts.map((b) => b.text).join('\n\n')) : null;
+  if (mediaFirst && grid) container.append(grid);
+  if (text) container.append(text);
+  if (!mediaFirst && grid) container.append(grid);
   if (code.length) {
     // Code gets its own full-width column: a chip is a paragraph, not a thumbnail,
     // and it looks wrong wrapped into the media grid's flex row.
@@ -298,16 +313,47 @@ function finishToolCard(card, { isError, blocks, step }) {
   status.textContent = isError ? 'failed' : (step ? `done · step ${step}` : 'done');
   if (isError) status.classList.add('err');
 
-  // The body is emptied rather than removed: removing it made the second call above
-  // throw on a null `querySelector`, and a collapsed card needs the pane to stay in
-  // the DOM so the click handler has something to reveal.
+  fillToolBody(card, blocks);
+}
+
+/**
+ * Fill a tool card's body from the blocks of its result, and say in the header how
+ * much media is in there.
+ *
+ * The body is emptied rather than removed: `finishToolCard` can be reached twice for
+ * one call id, and a *collapsed* card still needs the pane in the DOM for the click
+ * handler to have something to reveal.
+ *
+ * Media that arrived with the result is drawn here, inside the card, and the card is
+ * closed by default — so the header has to mention it. A header that says `web_fetch
+ * done · step 2` over a pile of page images reads as a call that found nothing worth
+ * looking at, which is exactly how the same images became a permanent fixture above
+ * the reply: they had to be visible somewhere. Saying so in the header is the visible
+ * part; the images themselves wait for the click, like the page text beside them.
+ */
+function fillToolBody(card, blocks) {
   const body = card.querySelector('.tool-body');
   if (!body) return;
+  card.querySelector('.tool-media')?.remove();
   body.textContent = '';
   delete body.dataset.has;
-  if (blocks && blocks.length) {
-    renderBlocks(body, outputBlocks(blocksOf(blocks), card.__args));
+
+  // `blocksOf` is applied to both callers' shapes: the live card holds the SSE blocks
+  // as they came off the wire, the re-rendered one holds blocks already normalised
+  // from the stored message, and the pass is idempotent either way.
+  const rendered = blocks && blocks.length ? outputBlocks(blocksOf(blocks), card.__args) : [];
+  if (rendered.length) {
+    renderBlocks(body, rendered, { mediaFirst: true });
     body.dataset.has = '1';
+  }
+  const label = mediaLabel(rendered);
+  if (label) {
+    // Left of the status rather than after it: the status is the card's fixed anchor in
+    // the right-hand corner, and a badge that came and went beside it would move it.
+    const head = card.querySelector('.tool-head');
+    const badge = h('span', 'tool-media', label);
+    badge.title = `${label} came in with this result — open the card to look`;
+    if (head) head.insertBefore(badge, head.querySelector('.tool-status'));
   }
   applyToolCollapsed(card);
 }
@@ -334,12 +380,9 @@ function renderMessage(message, { onEdit = null, onRegenerate = null, isLast = f
     card.querySelector('.spin-dot')?.remove();
     const status = card.querySelector('.tool-status');
     status.textContent = 'result';
-    const body = card.querySelector('.tool-body');
-    if (blocks.length) {
-      renderBlocks(body, outputBlocks(blocks, null));
-      body.dataset.has = '1';
-    }
-    applyToolCollapsed(card);
+    // The same pane the live card is filled by, so the streaming paint and the render
+    // after it cannot drift — which is where media in the body would visibly jump.
+    fillToolBody(card, blocks);
     inner.append(card);
     return turn;
   }

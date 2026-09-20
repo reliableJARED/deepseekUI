@@ -687,10 +687,16 @@ async def test_compress_video_writes_something_a_browser_can_play(registry, stor
 #
 # Two audiences, two destinations. A block the model is meant to see stays in the
 # tool result and is inlined into the next request; a block that exists so the *user*
-# can look at it is marked, cut out of the tool result, and hung on the assistant's
-# reply instead. The marker has to survive ingestion, which is the part with a real
-# failure mode: `ingest_tool_blocks` rewrites a block as it saves it, and a rewrite
-# that dropped an unknown key would silently turn every display back into vision.
+# can look at it is marked, and never replayed upstream. The marker has to survive
+# ingestion, which is the part with a real failure mode: `ingest_tool_blocks` rewrites
+# a block as it saves it, and a rewrite that dropped an unknown key would silently turn
+# every display back into vision.
+#
+# Marked is not the same as *pinned*, though, and the marker says which kind it is.
+# `display_media` was handed a file and a request, so its block is hung on the
+# assistant's reply and renders above the answer; media that merely arrived with a
+# result (`web_fetch` downloading the images on the page it read) is kept in that
+# result, where the frontend draws it inside the collapsed tool card.
 
 @pytest.fixture
 def outside(tmp_path):
@@ -728,10 +734,33 @@ def test_only_a_marked_media_block_is_for_the_user():
     from server.media import is_display_block
 
     assert is_display_block({"type": "image", "url": "/memory/c1/a.png", "display": True})
+    assert is_display_block({"type": "image", "url": "/memory/c1/a.png", "display": "inline"})
     assert not is_display_block({"type": "image", "url": "/memory/c1/a.png"})
     assert not is_display_block({"type": "text", "text": "hi", "display": True})
     # A marker with nothing to point at is not something to show.
     assert not is_display_block({"type": "image", "display": True})
+
+
+def test_media_that_merely_arrived_is_not_pinned_above_the_reply():
+    """What was asked for is pinned; what came in with a result is only marked."""
+    from server.media import (
+        DISPLAY_INLINE, DISPLAY_SHOWN, is_inline_block, is_pinned_block, split_display_blocks,
+    )
+
+    scraped = {"type": "image", "url": "/memory/c1/page.png", "display": DISPLAY_INLINE}
+    asked_for = {"type": "image", "url": "/memory/c1/chart.png", "display": DISPLAY_SHOWN}
+    older = {"type": "image", "url": "/memory/c1/old.png", "display": True}
+
+    assert is_inline_block(scraped) and not is_pinned_block(scraped)
+    assert is_pinned_block(asked_for) and not is_inline_block(asked_for)
+    # `True` is how the marker was spelled before there were two kinds, and a transcript
+    # written then still has to render the way it did when it was written.
+    assert is_pinned_block(older) and not is_inline_block(older)
+
+    shown, kept = split_display_blocks([scraped, asked_for, older])
+
+    assert shown == [asked_for, older]
+    assert kept == [scraped]
 
 
 def test_splitting_a_result_leaves_the_model_its_own_media():
@@ -740,22 +769,35 @@ def test_splitting_a_result_leaves_the_model_its_own_media():
     shown, kept = split_display_blocks([
         {"type": "text", "text": "two pictures"},
         {"type": "image", "url": "/memory/c1/for_user.png", "display": True},
+        {"type": "image", "url": "/memory/c1/from_the_page.png", "display": "inline"},
         {"type": "image", "url": "/memory/c1/for_model.png"},
     ])
 
     assert [b["url"] for b in shown] == ["/memory/c1/for_user.png"]
-    assert [b.get("url") or b.get("text") for b in kept] == ["two pictures", "/memory/c1/for_model.png"]
+    # The page image is kept, and keeping it is what puts it in the tool card rather
+    # than above the reply. It is still marked, so it is still not the model's to see.
+    assert [b.get("url") or b.get("text") for b in kept] == [
+        "two pictures", "/memory/c1/from_the_page.png", "/memory/c1/for_model.png",
+    ]
 
 
 def test_marking_does_not_touch_the_blocks_it_was_given():
     from server.media import mark_display_blocks
 
-    original = [{"type": "image", "url": "/memory/c1/a.png"}, {"type": "text", "text": "x"}]
+    original = [
+        {"type": "image", "url": "/memory/c1/a.png"},
+        {"type": "image", "url": "/memory/c1/b.png", "display": True},
+        {"type": "text", "text": "x"},
+    ]
     marked = mark_display_blocks(original)
 
-    assert marked[0]["display"] is True
+    # An MCP tool returns media because of what it was asked to do, not because anyone
+    # asked to see a picture, so it is marked as incidental rather than pinned.
+    assert marked[0]["display"] == "inline"
+    # A server that does know it was showing something keeps its own answer.
+    assert marked[1]["display"] is True
     assert "display" not in original[0]
-    assert marked[1] == {"type": "text", "text": "x"}
+    assert marked[2] == {"type": "text", "text": "x"}
 
 
 def test_the_note_left_behind_names_the_path_to_look_at():

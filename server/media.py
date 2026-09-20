@@ -47,7 +47,11 @@ __all__ = [
     "drop_partial_character",
     "classify_kind",
     "DISPLAY_KEY",
+    "DISPLAY_SHOWN",
+    "DISPLAY_INLINE",
     "is_display_block",
+    "is_pinned_block",
+    "is_inline_block",
     "split_display_blocks",
     "mark_display_blocks",
     "display_note",
@@ -814,12 +818,29 @@ class MediaStore:
 #: * an unmarked block feeds the model's vision — ``reduce_video_frames`` samples a
 #:   clip precisely so the model can describe it — so it stays in the tool message
 #:   and :mod:`server.rehydrate` inlines it into the next request;
-#: * a marked block exists to be *shown*: a page image ``web_fetch`` downloaded, a
-#:   file ``display_media`` was handed. It is cut out of the tool result, hung on the
-#:   assistant's turn so it renders above the answer, and deliberately not sent
-#:   upstream — the model can reach for ``inspect_media`` or ``resize_image`` with
-#:   the path it is given if it actually needs to look.
+#: * a marked block exists to be *shown* rather than seen, and is deliberately never
+#:   sent upstream — the model can reach for ``inspect_media`` or ``resize_image``
+#:   with the path it is given if it actually needs to look.
+#:
+#: There are two reasons a block ends up marked, and they do not want the same
+#: treatment, so the marker carries which one it was.
 DISPLAY_KEY = "display"
+
+#: The user *asked* to see this, and on the strength of that alone: ``display_media``
+#: was handed a file, a caption, and a request. It is hung on the assistant's turn so
+#: it renders above the answer — the picture is the point, and it should be the first
+#: thing on screen rather than a card that has to be opened.
+DISPLAY_SHOWN = "shown"
+
+#: The media merely *arrived* with a result. ``web_fetch`` downloads the images on the
+#: page it read because they are part of that page, not because anyone asked for them,
+#: and an MCP server has no way to distinguish the two by the time it answers. Pinning
+#: these to the top of the reply is what pushed five page posters between the reasoning
+#: and the answer for the life of the transcript — and they are not the user's to look
+#: at anyway; they are the same page whose text is already sitting in the tool card.
+#: So the block stays *in* that result and renders inside the card that carried it,
+#: which is collapsed by default. Still marked, so it is still never replayed upstream.
+DISPLAY_INLINE = "inline"
 
 #: A block the user watches inside an `<iframe>` rather than reads from disk: a
 #: YouTube or Vimeo page, where the file is on someone else's server and will stay
@@ -855,28 +876,59 @@ def is_display_block(block: Any) -> bool:
     return block_type in ("image", "video", "audio") and bool(block.get("url"))
 
 
+def is_inline_block(block: Any) -> bool:
+    """True for media that came in with a result rather than by request.
+
+    Marked, so still the user's and still never replayed upstream — but it belongs
+    with the result it arrived in, inside the collapsed card, not pinned above the
+    reply. See ``DISPLAY_INLINE``.
+    """
+    return is_display_block(block) and block.get(DISPLAY_KEY) == DISPLAY_INLINE
+
+
+def is_pinned_block(block: Any) -> bool:
+    """True for media that goes above the reply: the user asked to be shown it.
+
+    ``True`` is the original spelling of the marker and counts as pinned, which is
+    what keeps a transcript written before the two kinds existed rendering the way it
+    did when it was written.
+    """
+    return is_display_block(block) and not is_inline_block(block)
+
+
 def split_display_blocks(blocks: Sequence[Any]) -> tuple[list[dict], list[Any]]:
-    """Partition a tool result into ``(shown to the user, kept for the model)``."""
+    """Partition a tool result into ``(pinned above the reply, kept in the result)``.
+
+    Only what the user asked to see is taken out. Media that merely came in with the
+    result is *kept*, because where it is is where it belongs — the card that carried
+    it — and it is still marked, so keeping it in the message does not put it back in
+    front of the model (:mod:`server.rehydrate` turns it into a path instead).
+    """
     shown: list[dict] = []
     kept: list[Any] = []
     for block in blocks:
-        (shown if is_display_block(block) else kept).append(block)
+        (shown if is_pinned_block(block) else kept).append(block)
     return shown, kept
 
 
 def mark_display_blocks(blocks: Sequence[Any]) -> list[Any]:
-    """Copy ``blocks`` with the marker set on every media block.
+    """Copy ``blocks`` with the marker set on every media block an MCP tool returned.
 
-    For a source that is user-facing by nature rather than by intent: an MCP tool
-    returns media because a person asked to see something — ``web_fetch`` downloads
-    the images on the page it read — so there is no per-block decision to make and no
-    place in the tool to make it.
+    For a source that is user-facing by nature rather than by intent: ``web_fetch``
+    downloads the images on the page it read because a page has images, so there is no
+    per-block decision to make and no place in the tool to make it. That is exactly
+    why the marker these get is ``DISPLAY_INLINE`` — the block is the user's, not the
+    model's, but nobody asked for it, so it stays in the result rather than being
+    lifted onto the reply.
+
+    A block that already carries a marker is left alone, which is how a remote server
+    that genuinely knows it is showing something says so.
     """
     out: list[Any] = []
     for block in blocks:
         if isinstance(block, dict) and str(block.get("type") or "") in MEDIA_BLOCK_TYPES:
-            if block.get("url") or block.get("embed_url"):
-                block = {**block, DISPLAY_KEY: True}
+            if (block.get("url") or block.get("embed_url")) and not block.get(DISPLAY_KEY):
+                block = {**block, DISPLAY_KEY: DISPLAY_INLINE}
         out.append(block)
     return out
 

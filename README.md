@@ -479,13 +479,16 @@ is pure Python.
 
 ## Showing media to the user
 
-The tools above are for getting media *into* the model. This is the other direction.
+The tools above are for getting media *into* the model. This is the other direction, and it splits
+in two, because "the user wants to see this" and "this happened to be on the page the model read"
+are different things.
 
-When a tool hands back a picture, a clip or a sound — `web_fetch` downloads a page image into
-`mcp_server/web_media/`, an MCP server returns one inline, `display_media` is pointed at a file
-— it is not shown in the transcript, and it is not attached to the request either. It is
-**cut out** of the tool result and hung on the assistant turn the user reads to, rendered above
-the reply:
+### Media the user asked for
+
+When a tool is pointed at a picture, a clip or a sound **on purpose** (`display_media`, whether by
+path or by `https://` URL), it is not shown in the transcript, and it is not attached to the
+request either. It is **cut out** of the tool result and hung on the assistant turn the user reads
+to, rendered above the reply:
 
 ```
 [tool message]   text: "1 image was shown to the user… its path is /memory/<uuid>/shown_image_….png
@@ -508,11 +511,12 @@ the media in the tool result and let the tool card expand — is the one that wa
   way through, so a tool that later clears its download directory — which `web_fetch` does — cannot
   rot a transcript.
 
-Every image, video or audio block an **MCP** server returns is treated this way automatically:
-an MCP tool's output is aimed at a person, and the server has no way to know better. A block the
-model asked for itself (a `resize_image` result it is meant to look at) is not marked, and goes
-upstream as it always did. The marker never reaches the API: it rides on the message as
-`_display` and on the block as `display: true`, and both are stripped on the way out.
+Two markers record which of the two things happened. `display: "shown"` is this section: the
+user asked for it, so it is pinned above the reply. `display: "inline"` is the
+[next section](#media-that-merely-came-along): it arrived with a tool result, so it stays there.
+A block the model asked for itself (a `resize_image` result it is meant to look at) carries no
+marker at all, and goes upstream as it always did. Neither marker reaches the API: they ride on
+the message as `_display` and on the block as `display`, and both are stripped on the way out.
 
 `display_media` is the case where the model names a file itself. It is the one built-in tool that
 reads outside the conversation, and only from:
@@ -527,6 +531,25 @@ every conversation's files at once — those are referred to by their `/memory/<
 is already in scope for the conversation that owns them. Nothing outside those roots is
 reachable, so this is not a general read primitive: it copies bytes into the active conversation,
 it can only produce image/video/audio, and it never feeds a request.
+
+### Media that merely came along
+
+Every image, video or audio block an **MCP** server returns is marked `display: "inline"` — an MCP
+tool's output is not a request, and there is no way for the server to know better. `web_fetch`
+fetching a model card, for instance, brings back every image on the page: five of them for
+<https://huggingface.co/Qwen/Qwen-Image-2.1>. Pinning those above the reply would put a wall of
+images between the user and the answer, on every later turn of the conversation, for as long as
+the transcript lives.
+
+So they are left **in the result they came with**. The tool card that produced them renders them
+first, then the page text, and shows a counter in its header — `2 images`, `1 video` — so a
+collapsed card that is holding pictures is visible at a glance. Opening the card shows them; the
+card collapses with everything else, and reacts to *Collapse all* like the reasoning does.
+
+Nothing is discarded and nothing is attached to the request: the model still gets one line of
+prose naming each path, the same as for pinned media, so vision stays opt-in. The distinction is
+carried by the value of the marker, not by its presence — `display: true` still means "shown"
+and is what transcripts written before the split carry.
 
 ### Remote URLs
 

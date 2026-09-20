@@ -521,11 +521,15 @@ class ChatEngine:
     def _store_tool_result(self, uuid: str, call: ToolCall, outcome):
         """Persist a tool result, keeping media on disk and text in the message.
 
-        Returns ``(stored message, media the user was shown)``. Media meant for the
-        user is *removed* from the message rather than left in it: the transcript is
-        replayed on every later request, and media left here is media the model would
-        be charged for seeing on every one of them. What replaces it is a line naming
-        the path, which is the part the model can act on.
+        Returns ``(stored message, media to pin above the reply)``. Only media the user
+        asked to see is *removed* from the message: the transcript is replayed on every
+        later request, and media left in it is media the model would be charged for
+        seeing on every one of them. What replaces it is a line naming the path, which
+        is the part the model can act on.
+
+        Media that merely arrived with the result stays in it, and stays marked — so
+        where it sits changes nothing about what the model is sent, and the only thing
+        that moves is which part of the UI draws it.
         """
         content = outcome.content
 
@@ -560,6 +564,11 @@ class ChatEngine:
         it above that turn's text — which is what "show me the picture, then answer"
         means. When a turn ends on a tool step instead (the step limit was hit), the
         last assistant turn is still the last thing the user sees, so it still works.
+
+        Only what was asked for arrives here. Media that merely came in with a result
+        is left in the result and rendered inside the tool card, collapsed: an answer
+        is what the user is reading, and a row of page posters pinned above it is
+        attention taken from the answer. ``split_display_blocks`` draws that line.
         """
 
         def _attach(conv) -> None:
@@ -677,7 +686,11 @@ def _display_blocks(stored: Mapping[str, Any]) -> list[dict[str, Any]]:
             if value not in (None, "", 0, False):
                 shown[key] = value
         if block.get(DISPLAY_KEY):
-            shown[DISPLAY_KEY] = True
+            # The marker's *value* travels as well: "inline" is media that came in with
+            # the result and is drawn in the card, "shown" is media the user asked for
+            # and is already pinned above the reply. The UI needs the difference to
+            # know which of the two rows it is building.
+            shown[DISPLAY_KEY] = block.get(DISPLAY_KEY)
         out.append(shown)
     return out
 
