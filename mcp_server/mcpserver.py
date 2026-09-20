@@ -137,7 +137,8 @@ TOOLS = [
             "player — or reduce_video_frames when you need to watch the video's frames "
             "yourself; to show the user a URL's image, use display_media. "
             "Images come back only when a parsed HTML page references them, so fetching "
-"an image URL directly returns bytes rather than a picture."
+            "an image URL directly returns bytes rather than a picture."
+            "Reddit Specific Search: when fetching reddit pages reddit.com/r/StableDiffusion/comments/1wli1vi/an_hour_in_to_qwen21/ ->MUST CONVERT to arctic-shift using the post ID->arctic-shift.photon-reddit.com/api/posts/ids?ids=1wli1vi"
         ),
         "inputSchema": {
             "type": "object",
