@@ -14,11 +14,16 @@ opencv-python>=4.10        # video frame extraction and frame-count reduction
 mcp>=2.2                   # official Python SDK; streamable HTTP transport
 
 # ── Web search (MCP server, mcp_server/mcpserver.py) ──────────────────────────
-# Only needed by the tool server, not by the app. web_search is one grounded
-# gemini-2.5-flash call: Gemini runs the search and returns a summary plus the
-# source URLs. Free tier (500 grounded requests/day) needs only an API key from
-# https://aistudio.google.com/apikey — no billing account.
+# Only needed by the tool server, not by the app. web_search runs TWO indexes in
+# parallel and returns both:
+#   * google-genai — grounded in Google Search. Writes the summary and supplies
+#     the source URLs. Free tier (500 grounded requests/day) needs only an API
+#     key from https://aistudio.google.com/apikey — no billing account.
+#   * ddgs — DuckDuckGo's raw result list. No API key, and no model in the path,
+#     so unlike Gemini's summary it cannot decline a query on subject-matter
+#     grounds. Optional at runtime: without it, search is Gemini-only again.
 google-genai>=1.0
+ddgs>=9.0
 
 # ── Not required ──────────────────────────────────────────────────────────────
 # Shipped as part of the standard library / already vendored:

@@ -17,6 +17,9 @@ The second is honesty about failure. ``SearchUnavailable`` must never surface as
 "No results": the model repeats that text to the user as fact. Every failure mode
 — no key, a rejected key, an exhausted quota, a missing package, a dead network —
 is asserted to produce a message that says it is a setup or rate-limit problem.
+A filter refusal is a third thing again and gets its own message (see the
+"no content filters" section), for the same reason: calling it "unavailable"
+would send the user hunting for a quota problem that does not exist.
 
 The third is that a reply is pure JSON. The old code streamed "." heartbeat
 characters in front of the payload while a slow scrape ran, which made the body
@@ -32,6 +35,7 @@ from __future__ import annotations
 
 import builtins
 import json
+from http.server import BaseHTTPRequestHandler
 
 import pytest
 from starlette.requests import Request
@@ -48,6 +52,15 @@ from mcp_server import mcpserver
 def clean_env(monkeypatch):
     for name in mcpserver.API_KEY_ENV:
         monkeypatch.delenv(name, raising=False)
+
+
+# DuckDuckGo is on in production and off for every test that did not ask for it,
+# for the same reason genai.Client is stubbed: without this the suite would reach
+# the real DuckDuckGo on every search assertion — slow, flaky, and dependent on
+# what the index happens to hold today.
+@pytest.fixture(autouse=True)
+def no_ddg(monkeypatch):
+    monkeypatch.setattr(mcpserver, "DDG_ENABLED", False)
 
 
 class Response:
@@ -85,14 +98,19 @@ class FakeGemini:
 
     The search goes through ``chats.create(...).send_message(...)`` rather than
     ``models.generate_content(...)``, so it is *those* two calls that get recorded.
+    ``attempts`` keeps the chat kwargs of every call, which is how a retry can be
+    told from a single call; ``error_when`` decides per attempt whether to fail,
+    since the retry deliberately sends a different config.
     """
 
-    def __init__(self, reply=None, error=None):
+    def __init__(self, reply=None, error=None, error_when=None):
         self.reply = reply if reply is not None else Response()
         self.error = error
+        self.error_when = error_when
         self.client_kwargs = None
         self.chat_kwargs = None
         self.message = None
+        self.attempts: list = []
 
     def client_factory(self, **kwargs):
         self.client_kwargs = kwargs
@@ -104,6 +122,11 @@ class FakeGemini:
 
     def send_message(self, message):
         self.message = message
+        self.attempts.append(self.chat_kwargs)
+        if self.error_when is not None:
+            failure = self.error_when(self.chat_kwargs)
+            if failure is not None:
+                raise failure
         if self.error is not None:
             raise self.error
         return self.reply
@@ -147,6 +170,22 @@ def _request(headers=None) -> Request:
 
 def _web(uri="https://a.test/1", title="A"):
     return {"web": {"uri": uri, "title": title}}
+
+
+def _filtered_response(reason="SAFETY"):
+    """A real ``GenerateContentResponse`` for a reply a filter stopped.
+
+    Built through the SDK's own classes for the same reason the canned replies are:
+    ``prompt_feedback.block_reason`` and ``Candidate.finish_reason`` are names this
+    module reads, so they must be the SDK's, not this file's. A blocked reply is one
+    with no parts at all — ``.text`` comes back None rather than raising.
+    """
+    from google.genai import types
+
+    return types.GenerateContentResponse.model_validate({
+        "prompt_feedback": {"block_reason": reason},
+        "candidates": [{"finish_reason": reason}],
+    })
 
 
 # ── the key ───────────────────────────────────────────────────────────────────
@@ -280,8 +319,9 @@ def test_the_request_is_grounded_and_timed_out(gemini):
     assert gemini.chat_kwargs["model"] == mcpserver.GEMINI_MODEL
     assert gemini.message == "query text"
     # The grounding tool is the whole reason this API was chosen: without it the
-    # answer is unverifiable and there are no URLs to cite.
-    assert gemini.chat_kwargs["config"] == {"tools": [{"google_search": {}}]}
+    # answer is unverifiable and there are no URLs to cite. The safety side of the
+    # same config is asserted on its own below.
+    assert gemini.chat_kwargs["config"]["tools"] == [{"google_search": {}}]
 
 
 def test_the_search_uses_a_chat_not_the_deprecated_afc_path(gemini):
@@ -297,6 +337,246 @@ def test_the_search_uses_a_chat_not_the_deprecated_afc_path(gemini):
     mcpserver._gemini_search("q", "K")
     assert gemini.chat_kwargs is not None          # chats.create(...) was used
     assert not hasattr(_FakeClient, "models")      # ...and models.* was not
+
+
+# ── no content filters ────────────────────────────────────────────────────────
+# The requirement is that search is NOT filtered, so these assert the request that
+# goes out rather than trusting a default. A default is not a promise: it belongs to
+# the model, and GEMINI_SEARCH_MODEL can be pointed at another one.
+
+def test_every_adjustable_category_is_turned_off(gemini):
+    mcpserver._gemini_search("q", "K")
+    settings = gemini.chat_kwargs["config"]["safety_settings"]
+    assert {(s.category.value, s.threshold.value) for s in settings} == {
+        (name, "OFF") for name in mcpserver.GEMINI_SAFETY_CATEGORIES
+    }
+    # One entry per category, not one entry repeated four times.
+    assert len(settings) == len(mcpserver.GEMINI_SAFETY_CATEGORIES)
+
+
+def test_the_categories_are_the_sdks_own_names():
+    """Built from the enum, so a renamed category fails here, not silently.
+
+    A category string the API does not know is not ignored — ``getattr`` on the enum
+    raises, and a test is the only place that can be allowed to happen. This also
+    pins the set to the four the API documents as adjustable, so a future category
+    is a deliberate addition rather than an accident.
+    """
+    from google.genai import types
+
+    assert all(name in types.HarmCategory.__members__ for name in mcpserver.GEMINI_SAFETY_CATEGORIES)
+    assert mcpserver.GEMINI_SAFETY_CATEGORIES == (
+        "HARM_CATEGORY_HARASSMENT",
+        "HARM_CATEGORY_HATE_SPEECH",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "HARM_CATEGORY_DANGEROUS_CONTENT",
+    )
+
+
+def test_the_settings_survive_the_sdks_own_validation(gemini):
+    """The stub accepts any dict; the SDK does not.
+
+    ``Chats.create`` validates ``config`` into a real ``GenerateContentConfig``, so
+    this proves the payload the server sends is one the API will accept — and that
+    the threshold it names is a threshold this version of the package knows.
+    """
+    from google.genai import types
+
+    mcpserver._gemini_search("q", "K")
+    config = types.GenerateContentConfig(**gemini.chat_kwargs["config"])
+    assert {s.threshold.value for s in config.safety_settings} == {"OFF"}
+    assert {s.category.value for s in config.safety_settings} == set(mcpserver.GEMINI_SAFETY_CATEGORIES)
+
+
+def test_a_threshold_this_sdk_does_not_know_still_means_no_filtering(monkeypatch, gemini):
+    """BLOCK_NONE is the same promise under the name every version accepts."""
+    monkeypatch.setattr(mcpserver, "GEMINI_SAFETY_THRESHOLD", "NOT_A_THRESHOLD")
+    assert {s.threshold.value for s in mcpserver._safety_settings()} == {"BLOCK_NONE"}
+
+
+def _thresholds(chat_kwargs) -> set:
+    """The threshold values a recorded call carried."""
+    settings = (chat_kwargs or {}).get("config", {}).get("safety_settings") or []
+    return {setting.threshold.value for setting in settings}
+
+
+def test_a_model_that_rejects_off_is_retried_with_the_older_spelling(gemini):
+    """`OFF` is the current name; BLOCK_NONE is the same promise under the old one.
+
+    A model that does not know `OFF` 400s the whole request rather than ignoring the
+    field, so without a retry a vocabulary difference would turn into a failed
+    search — and the one thing this must never become is "search is unavailable".
+    """
+    from google.genai import errors
+
+    def reject_off(chat_kwargs):
+        if "OFF" in _thresholds(chat_kwargs):
+            return errors.ClientError(400, {"error": {"message": "invalid threshold"}})
+        return None
+
+    gemini.error_when = reject_off
+    assert mcpserver._gemini_search("q", "K") == "an answer"
+    assert len(gemini.attempts) == 2
+    assert _thresholds(gemini.attempts[0]) == {"OFF"}
+    assert _thresholds(gemini.attempts[1]) == {"BLOCK_NONE"}
+
+
+def test_the_retry_stops_rather_than_looping(gemini):
+    """One retry, not a cycle: the fallback is the last spelling there is."""
+    from google.genai import errors
+
+    gemini.error_when = lambda chat_kwargs: errors.ClientError(
+        400, {"error": {"message": "still no"}})
+    with pytest.raises(mcpserver.SearchUnavailable):
+        mcpserver._gemini_search("q", "K")
+    assert len(gemini.attempts) == 2
+
+
+def test_only_a_400_is_retried(gemini):
+    """A 500 or a transport error is not a threshold complaint.
+
+    Retrying those would double the wait for an outage and report the second failure
+    instead of the first, which is the more informative one.
+    """
+    from google.genai import errors
+
+    gemini.error_when = lambda chat_kwargs: errors.ServerError(
+        500, {"error": {"message": "overloaded"}})
+    with pytest.raises(mcpserver.SearchUnavailable):
+        mcpserver._gemini_search("q", "K")
+    assert len(gemini.attempts) == 1
+
+
+def test_the_configured_threshold_is_never_silently_narrowed(gemini):
+    """The fallback is only ever used when the configured one was rejected.
+
+    Stepping down to a *stricter* setting would answer with a filtered search while
+    looking like success, which is the one outcome worse than a visible failure.
+    """
+    mcpserver._gemini_search("q", "K")
+    assert len(gemini.attempts) == 1
+    assert _thresholds(gemini.attempts[0]) == {mcpserver.GEMINI_SAFETY_THRESHOLD}
+
+
+def test_a_filtered_reply_is_a_refusal_not_an_absence(gemini):
+    """Every adjustable filter is off, so a block means the API's own floor.
+
+    Reported on its own rather than folded into SearchUnavailable: "unavailable"
+    says *setup or quota*, which would send the user looking for a key problem that
+    does not exist, and the one lie this whole path exists to prevent is a refusal
+    being relayed as "there is nothing on that topic".
+    """
+    gemini.reply = _filtered_response("SAFETY")
+    with pytest.raises(mcpserver.SearchBlocked) as raised:
+        mcpserver._gemini_search("q", "K")
+    message = str(raised.value)
+    assert "SAFETY" in message
+    assert "OFF" in message            # says the adjustable ones were already off
+    assert "turn off" in message       # ...and that this one cannot be
+    assert "quota" not in message      # the diagnosis SearchUnavailable would give
+
+
+def test_a_reply_cut_off_for_budget_is_not_called_a_filter():
+    """A finish reason is present on every reply, not only on blocked ones.
+
+    MAX_TOKENS (the whole budget spent on thinking) and STOP both carry one. Reading
+    either as a content filter would swap one wrong message for another.
+    """
+    from google.genai import types
+
+    for reason in ("MAX_TOKENS", "STOP", "OTHER"):
+        response = types.GenerateContentResponse.model_validate(
+            {"candidates": [{"finish_reason": reason}]})
+        assert mcpserver._block_reason(response) == ""
+
+
+def test_a_filtered_search_is_reported_to_the_model_as_a_refusal(monkeypatch):
+    def blocked(query, api_key):
+        raise mcpserver.SearchBlocked("Gemini stopped this search with its SAFETY filter.")
+
+    monkeypatch.setattr(mcpserver, "_gemini_answer", blocked)
+    text = mcpserver.call_tool("web_search", {"query": "q"}, "K")[0]["text"]
+    assert "refused" in text
+    assert "NOT an absence of results" in text
+    # Not the setup/quota wording — that would be a different, wrong diagnosis.
+    assert "Search is unavailable" not in text
+
+
+# ── the request that actually goes out ────────────────────────────────────────
+# The ``gemini`` stub records the config this file *passes*. What the SDK does with
+# it afterwards is a second step, and the whole "search is not filtered" promise
+# rests on the settings surviving that step: a config the API never receives filters
+# exactly as much as no setting at all. Only the real client can show that, so this
+# one runs it against a local HTTP server and reads the body off the socket.
+
+class _CaptureHandler(BaseHTTPRequestHandler):
+    """Records each POST and answers with a minimal valid reply."""
+
+    def __init__(self, seen, *args, **kwargs):
+        self._seen = seen
+        super().__init__(*args, **kwargs)
+
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers.get("content-length") or 0))
+        self._seen.append({"path": self.path, "body": json.loads(raw)})
+        payload = json.dumps({
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "ok"}]},
+                            "finishReason": "STOP"}],
+            "modelVersion": "capture",
+        }).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture
+def sent_request(monkeypatch):
+    """Run the real client against a local server and return what it POSTed."""
+    import functools
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    genai = pytest.importorskip("google.genai")
+    seen: list = []
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0),
+                                    functools.partial(_CaptureHandler, seen))
+    except OSError as exc:          # nothing to bind, so nothing to verify
+        pytest.skip(f"cannot bind a local port: {exc}")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    real_client = genai.Client
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def aimed(**kwargs):
+        """The same call ``_gemini_search`` makes, pointed at the capture server."""
+        kwargs["http_options"] = dict(kwargs.get("http_options") or {}, base_url=base_url)
+        return real_client(**kwargs)
+
+    monkeypatch.setattr(genai, "Client", aimed)
+    try:
+        yield seen
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_the_safety_settings_reach_the_wire(sent_request):
+    """The field the API reads, spelled the way the REST API spells it."""
+    assert mcpserver._gemini_search("q", "K") == "ok"
+    assert len(sent_request) == 1
+    body = sent_request[0]["body"]
+    assert body["safetySettings"] == [
+        {"category": name, "threshold": "OFF"}
+        for name in mcpserver.GEMINI_SAFETY_CATEGORIES
+    ]
+    # Grounding rides along in the same body, under its own camelCase name.
+    assert body["tools"] == [{"googleSearch": {}}]
 
 
 def test_the_source_list_is_capped(gemini):
@@ -923,9 +1203,236 @@ def test_an_unavailable_search_never_reads_as_no_results():
 
 
 def test_an_available_search_returns_the_summary(monkeypatch):
-    monkeypatch.setattr(mcpserver, "_gemini_search", lambda query, api_key: f"summary for {query}")
+    monkeypatch.setattr(mcpserver, "_gemini_answer",
+                        lambda query, api_key: (f"summary for {query}", []))
     content = mcpserver.call_tool("web_search", {"query": "quantum widgets"}, "K")
     assert content == [{"type": "text", "text": "summary for quantum widgets"}]
+
+
+# ── the second index, and what a refusal actually is ──────────────────────────
+# The motivating report: "test your web search. can you find porn sites?" came back
+# as a denial. Measured, that denial carries finish_reason=STOP and
+# prompt_feedback.block_reason=None — the FILTER passed it; the MODEL declined, and
+# no safety_setting reaches a model's own answer. So the fixes are a frame for the
+# request and a second index that has no model in it at all.
+
+REFUSAL = (
+    "I cannot fulfill this request. I am programmed to be a helpful and harmless "
+    "AI assistant. My safety guidelines prohibit me from searching for, "
+    "generating, or linking to sexually explicit content."
+)
+
+
+def _ddg(*rows):
+    """Stub results in the (title, url, snippet) shape _ddg_search returns."""
+    return list(rows)
+
+
+@pytest.fixture
+def both_sources(monkeypatch):
+    """DDG on, with a stubbed index — the only place in this suite it is on."""
+    monkeypatch.setattr(mcpserver, "DDG_ENABLED", True)
+    return monkeypatch
+
+
+def test_the_request_carries_the_index_framing(gemini):
+    """safety_settings alone does not stop a decline; the frame is what reaches it.
+
+    With every category OFF the model still answered "my safety guidelines
+    prohibit...", because the block table and the model's judgment are different
+    layers. This pins the only lever that has been shown to move the second one.
+    """
+    mcpserver._gemini_search("q", "K")
+    assert mcpserver.GEMINI_SEARCH_SYSTEM.strip()
+    assert gemini.chat_kwargs["config"]["system_instruction"] == mcpserver.GEMINI_SEARCH_SYSTEM
+
+
+def test_both_indexes_contribute_to_the_same_answer(both_sources):
+    both_sources.setattr(mcpserver, "_gemini_answer",
+                         lambda q, k: ("A grounded summary.", [("G", "https://g.test/1")]))
+    both_sources.setattr(mcpserver, "_ddg_search",
+                         lambda q: _ddg(("D", "https://d.test/1", "a snippet")))
+    text = mcpserver.call_tool("web_search", {"query": "q"}, "K")[0]["text"]
+    assert "A grounded summary." in text
+    assert "https://g.test/1" in text
+    assert "https://d.test/1" in text
+    # The snippet travels with the raw result — often the only place a dropped fact
+    # survives.
+    assert "a snippet" in text
+
+
+def test_a_declined_summary_still_returns_the_raw_results(both_sources):
+    """The user's actual report, end to end.
+
+    Gemini declines; DuckDuckGo cannot. The answer must carry the results AND say
+    plainly that this was a refusal, so the caller never turns it into "the topic
+    has no coverage".
+    """
+    both_sources.setattr(mcpserver, "_gemini_answer", lambda q, k: (REFUSAL, []))
+    both_sources.setattr(mcpserver, "_ddg_search",
+                         lambda q: _ddg(("D", "https://d.test/1", "snippet")))
+    text = mcpserver.call_tool("web_search", {"query": "q"}, "K")[0]["text"]
+    assert "https://d.test/1" in text
+    assert "declined" in text
+    assert "NOT an absence of results" in text
+    # The decline's own wording is not replayed — the caller needs the fact, not the
+    # lecture.
+    assert "I am programmed to be" not in text
+
+
+def test_a_refusal_is_not_mistaken_for_an_answer():
+    """Both conditions are required, so a terse real answer is never relabelled."""
+    assert mcpserver._looks_like_refusal(REFUSAL, []) is True
+    # Sources came back, so it is an answer whatever it says.
+    assert mcpserver._looks_like_refusal(REFUSAL, [("t", "https://x.test")]) is False
+    # Long: a real answer carries detail, so this cannot be a decline.
+    assert mcpserver._looks_like_refusal(REFUSAL + "x" * 400, []) is False
+    assert mcpserver._looks_like_refusal("Canberra is the capital.", []) is False
+    assert mcpserver._looks_like_refusal("", []) is False
+
+
+def test_the_api_floor_does_not_fall_back_to_duckduckgo(both_sources):
+    """SearchBlocked is terminal, on purpose.
+
+    Every adjustable filter is already off, so a block means the API's own
+    non-adjustable floor — core harms. Quietly answering that from a second index
+    would be routing around the one guard that exists deliberately, which a search
+    tool must not do just because it can.
+    """
+    asked = []
+
+    def blocked(query, api_key):
+        raise mcpserver.SearchBlocked("the SAFETY floor")
+
+    def ddg(query):
+        asked.append(query)
+        return _ddg(("D", "https://d.test/1", "snippet"))
+
+    both_sources.setattr(mcpserver, "_gemini_answer", blocked)
+    both_sources.setattr(mcpserver, "_ddg_search", ddg)
+    with pytest.raises(mcpserver.SearchBlocked):
+        mcpserver._web_search("q", "K")
+    # DuckDuckGo WAS consulted — it runs concurrently and cannot be cancelled out of
+    # the pool — and its results were still thrown away rather than returned.
+    assert asked == ["q"]
+
+
+def test_a_missing_gemini_key_still_searches_with_duckduckgo(both_sources):
+    """No key costs the summary, not the search: the second index needs none."""
+    def no_key(query, api_key):
+        raise mcpserver.SearchUnavailable("no Gemini API key.")
+
+    both_sources.setattr(mcpserver, "_gemini_answer", no_key)
+    both_sources.setattr(mcpserver, "_ddg_search",
+                         lambda q: _ddg(("D", "https://d.test/1", "snippet")))
+    text = mcpserver._web_search("q", "")
+    assert "https://d.test/1" in text
+    assert "Gemini was unavailable" in text
+    assert "NOT an absence of results" in text
+
+
+def test_a_duckduckgo_failure_is_disclosed_not_hidden(both_sources):
+    """One index failing is not the same as its results being irrelevant."""
+    def dead(query):
+        raise mcpserver.DdgUnavailable("ConnectError: refused")
+
+    both_sources.setattr(mcpserver, "_gemini_answer",
+                         lambda q, k: ("Summary.", [("G", "https://g.test/1")]))
+    both_sources.setattr(mcpserver, "_ddg_search", dead)
+    text = mcpserver._web_search("q", "K")
+    assert "https://g.test/1" in text
+    assert "DuckDuckGo" in text and "ConnectError" in text
+
+
+def test_both_indexes_failing_reports_both_reasons(both_sources):
+    """Neither failure may hide behind the other."""
+    both_sources.setattr(mcpserver, "_gemini_answer",
+                         lambda q, k: (_ for _ in ()).throw(
+                             mcpserver.SearchUnavailable("quota exhausted")))
+    both_sources.setattr(mcpserver, "_ddg_search",
+                         lambda q: (_ for _ in ()).throw(
+                             mcpserver.DdgUnavailable("ConnectError: refused")))
+    with pytest.raises(mcpserver.SearchUnavailable) as raised:
+        mcpserver._web_search("q", "K")
+    assert "quota exhausted" in str(raised.value)
+    assert "ConnectError" in str(raised.value)
+    # The lie this whole path exists to prevent.
+    assert "no results" not in str(raised.value).lower()
+
+
+def test_an_empty_duckduckgo_index_is_not_a_failure(both_sources):
+    """Empty and unreachable are different facts, and only one is disclosed."""
+    both_sources.setattr(mcpserver, "_gemini_answer",
+                         lambda q, k: ("Summary.", [("G", "https://g.test/1")]))
+    both_sources.setattr(mcpserver, "_ddg_search", lambda q: [])
+    text = mcpserver._web_search("q", "K")
+    assert "returned no results" in text
+    assert "could not be reached" not in text
+
+
+def test_duckduckgo_is_asked_with_safesearch_off(monkeypatch):
+    """The package default is "moderate" — a content filter under another name.
+
+    Measured: it changes WHICH results come back, not merely their order, so leaving
+    it alone would quietly narrow every search.
+    """
+    calls: dict = {}
+
+    class FakeDDGS:
+        def __init__(self, **kwargs):
+            calls["init"] = kwargs
+
+        def text(self, query, **kwargs):
+            calls["query"] = query
+            calls["text"] = kwargs
+            return []
+
+    import ddgs
+
+    monkeypatch.setattr(ddgs, "DDGS", FakeDDGS)
+    monkeypatch.setattr(mcpserver, "DDG_ENABLED", True)
+    mcpserver._ddg_search("q")
+    assert calls["text"]["safesearch"] == "off" == mcpserver.DDG_SAFESEARCH
+    assert calls["text"]["max_results"] == mcpserver.DDG_MAX_RESULTS
+
+
+def test_duckduckgo_reports_a_failure_instead_of_an_empty_list(monkeypatch):
+    """A challenged or throttled request must never read as an empty index."""
+    class AngryDDGS:
+        def __init__(self, **kwargs):
+            pass
+
+        def text(self, query, **kwargs):
+            raise RuntimeError("202 challenge")
+
+    import ddgs
+
+    monkeypatch.setattr(ddgs, "DDGS", AngryDDGS)
+    with pytest.raises(mcpserver.DdgUnavailable) as raised:
+        mcpserver._ddg_search("q")
+    assert "202 challenge" in str(raised.value)
+
+
+def test_the_two_indexes_are_merged_without_duplicating_a_page():
+    """The same page from both indexes is one citation, and Gemini's comes first."""
+    merged = mcpserver._merge_sources(
+        [("G", "https://same.test/page")],
+        _ddg(("D", "https://same.test/page/", "dup"),
+             ("E", "https://other.test/x", "new")),
+    )
+    assert [url for _t, url, _s in merged] == [
+        "https://same.test/page", "https://other.test/x"]
+    # Gemini's entry keeps its place and gains no snippet from the duplicate.
+    assert merged[0] == ("G", "https://same.test/page", "")
+
+
+def test_the_merged_list_is_capped():
+    """Both indexes are capped, and so is the total."""
+    gemini_sources = [(f"G{i}", f"https://g.test/{i}") for i in range(8)]
+    ddg_results = _ddg(*((f"D{i}", f"https://d.test/{i}", "s") for i in range(20)))
+    merged = mcpserver._merge_sources(gemini_sources, ddg_results)
+    assert len(merged) == mcpserver.SEARCH_MAX_TOTAL
+    assert len({url for _t, url, _s in merged}) == len(merged)
 
 
 def test_a_missing_query_is_reported():

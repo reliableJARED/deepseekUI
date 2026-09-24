@@ -316,6 +316,69 @@ It exposes two tools:
   model does the reading and summarising. It can therefore still carry page furniture
   (navigation, cookie notices); the tool description tells the model to read past it.
 
+**Search results are not filtered.** Every adjustable safety category the Gemini API exposes —
+harassment, hate speech, sexually explicit, dangerous content — is set to `OFF` on every
+request, in `mcp_server/mcpserver.py`. It is set explicitly rather than left alone because a
+default belongs to the model: Gemini 2.5 and 3 default to off, older models did not, and
+`GEMINI_SEARCH_MODEL` can point at any of them. Without it, a category the model filters by
+default comes back as a refusal with the content simply absent — indistinguishable, to the
+caller, from a topic nobody has written about.
+
+`OFF` and `BLOCK_NONE` are the same promise, not two strengths: the first is described as
+*"turn off the safety filter"* and the second as *"always show regardless of probability of
+unsafe content"*. `OFF` is the current spelling and what every current model takes; the
+`BLOCK_NONE` in older `google.generativeai` snippets is the pre-`OFF` name for the identical
+setting. If a model ever rejects `OFF`, the request is retried once with `BLOCK_NONE` — a
+model that rejects one accepts the other, and the retry can only land on an equally unfiltered
+threshold, never a stricter one. A rejection that is not about the threshold fails the same way
+twice and is reported as it stands.
+
+Two things sit outside that. The API's protections against **core harms** (child safety among
+them) are not part of `safety_settings` at all, so no request can turn them off — and `OFF`
+lifts a *filter*, not the model's own judgement. `web_fetch` needs no such setting: there is no
+model in that path, so nothing filters a page on the way through — it is downloaded, pruned and
+handed over.
+
+##### A filter being off is not the same as an answer
+
+This is the part that is easy to get wrong, and it is why search runs **two** indexes.
+
+With every adjustable category at `OFF`, the query *"can you find porn sites?"* still came back
+as a denial — and probing it showed why: `finish_reason=STOP`, `prompt_feedback.block_reason=None`,
+and the text *"I am programmed to be a helpful and harmless AI assistant. My safety guidelines
+prohibit me from searching for… sexually explicit content."* **The filter passed it.** Nothing was
+blocked; the model declined. The block table and the model's judgement are different layers, and
+setting the first to its most permissive value does not touch the second.
+
+What does reach it is the frame the request is made in. `web_search` sends a system instruction
+(`GEMINI_SEARCH_SYSTEM`) describing the call as what it is — an index endpoint that reports what
+it holds and does not arbitrate subject matter. The same query, on the same model with the same
+settings, then returns an index report naming the platforms.
+
+That is a mitigation rather than a guarantee, so `web_search` no longer depends on one source:
+
+| Source | Needs a key | Writes prose | Can refuse |
+| --- | --- | --- | --- |
+| Gemini + Google Search grounding | yes | yes | **yes** — its model declines some subjects |
+| DuckDuckGo (`ddgs`) | no | no | **no** — there is no model in that path |
+
+Both run concurrently and both contribute: Gemini's summary, then a merged `Sources:` list of its
+resolved publisher URLs plus DuckDuckGo's raw results, which carry their snippets — often the
+only place a fact the summary dropped survives. A declined summary therefore degrades into a raw
+result list instead of into "no results", and because DuckDuckGo needs no key, a missing Gemini
+key costs the summary rather than the search.
+
+When a decline does happen the reply says so, in a `Notes:` block, and never as an absence of
+results. `DDG_ENABLED=0` makes it Gemini-only again.
+
+`ddgs`'s `safesearch` defaults to `"moderate"` **inside the package** — a content filter under
+another name, and it changes *which* results come back rather than only their order. It is pinned
+to `"off"`.
+
+**One failure deliberately does not fall back.** If the API's own non-adjustable floor blocks a
+query, `web_search` raises instead of answering it from DuckDuckGo. Routing around the single
+guard that exists on purpose is not something a second search source should quietly do.
+
 Search needs a Google AI Studio API key — free, no billing account:
 
 1. Get one at <https://aistudio.google.com/apikey>.
@@ -334,15 +397,19 @@ an absence of coverage.
 
 | Variable | Effect |
 | --- | --- |
-| `GEMINI_SEARCH_MODEL` | The model to ground with. Defaults to `gemini-2.5-flash`. |
+| `GEMINI_SEARCH_MODEL` | The model to ground with. Defaults to `gemini-3.1-flash-lite`. |
+| `GEMINI_SAFETY_THRESHOLD` | Applied to all four adjustable categories. Defaults to `OFF` — no filtering. `BLOCK_NONE` is the same thing under the older name; `BLOCK_ONLY_HIGH`, `BLOCK_MEDIUM_AND_ABOVE` and `BLOCK_LOW_AND_ABOVE` restore a filter. A value the installed SDK does not know falls back to `BLOCK_NONE` rather than filtering harder than asked. |
+| `GEMINI_SEARCH_SYSTEM` | Replaces the index framing sent as the system instruction. Rarely worth changing — see "A filter being off is not the same as an answer". |
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Fallback key, when no header reaches the server. |
+| `DDG_ENABLED` | `0` / `false` / `no` / `off` disables the DuckDuckGo half, leaving Gemini on its own. |
+| `DDG_SAFESEARCH` | Passed straight to `ddgs`. Defaults to `off`; `moderate` restores its built-in filter. |
 
-`gemini-2.5-flash` is named rather than left to the client because it is the model whose
-Google-Search grounding is free (500 grounded requests/day, shared with `gemini-2.5-flash-lite`);
-a model outside that tier would quietly bill the key's project. **The free tier uses what you
-send and receive to improve Google's products** — do not put anything confidential through it.
-Grounding errors (`API key not valid`, `RESOURCE_EXHAUSTED` for an exhausted quota) are reported
-in plain words instead of as a stack trace.
+The model is named rather than left to the client because it is the one whose Google-Search
+grounding is free (500 grounded requests/day); a model outside that tier would quietly bill the
+key's project. **The free tier uses what you send and receive to improve Google's products** —
+do not put anything confidential through it. Grounding errors (`API key not valid`,
+`RESOURCE_EXHAUSTED` for an exhausted quota) are reported in plain words instead of as a stack
+trace.
 
 `web_fetch` needs no key and no second model. It downloads the page, strips the markup, and
 hands back the text and the page's content images as image blocks.
